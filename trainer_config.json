@@ -1,0 +1,15 @@
+{
+  "lookback": 120,
+  "hidden": 256,
+  "layers": 2,
+  "batch_size": 1024,
+  "lr_decay": 0.997,
+  "epochs1": 30,
+  "epochs2": 30,
+  "epochs3": 30,
+  "lr1": 0.001,
+  "lr2": 0.001,
+  "lr3": 0.001,
+  "dir_weight": 1.5,
+  "out_prefix": "AAPL"
+}

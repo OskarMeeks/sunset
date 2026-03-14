@@ -1,15 +1,18 @@
 {
   "lookback": 120,
   "hidden": 256,
-  "layers": 2,
-  "batch_size": 1024,
+  "layers": 6,
+  "batch_size": 4096,
   "lr_decay": 0.997,
-  "epochs1": 30,
-  "epochs2": 30,
-  "epochs3": 30,
-  "lr1": 0.001,
-  "lr2": 0.001,
-  "lr3": 0.001,
+  "epochs1": 300,
+  "epochs2": 300,
+  "epochs3": 300,
+  "lr1": 0.0003,
+  "lr2": 0.0003,
+  "lr3": 0.0003,
+  "bar_mins": 5,
   "dir_weight": 1.5,
-  "out_prefix": "AAPL"
+  "l2_lambda": 0.0001,
+  "early_stop_patience": 15,
+  "out_prefix": "default"
 }

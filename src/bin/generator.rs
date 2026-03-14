@@ -1,31 +1,21 @@
-// fetch_stock_data.rs
+// generator.rs
 //
-// Downloads real minute-by-minute stock data from Twelve Data and saves it
-// to a per-ticker CSV file in the exact format stock_trainer expects.
+// Shared data-fetching library used by cascade_trainer and scan_predict.
 //
-// Features:
-//   - One API call per week of data (~1950 rows per call)
-//   - Checks existing file before each call — skips weeks already downloaded
-//   - Each ticker gets its own file: AAPL_data.csv, TSLA_data.csv etc.
-//   - Appends new data and re-sorts the file oldest-first
+// Exposes:
+//   - data_file_for       — canonical CSV filename for a symbol
+//   - maybe_download      — week-by-week fetch for a date range (trainer path)
+//   - ensure_data_for_date — fill in a specific missing date (predict --at path)
+//   - fetch_or_load       — smart live loader: local CSV → API top-up (predict live path)
+//   - parse_csv           — CSV → Vec<StockData>
+//   - StockData           — shared bar struct used by both callers
 //
-// Add to Cargo.toml:
-//   [dependencies]
-//   chrono    = { version = "0.4", features = ["serde"] }
-//   reqwest   = { version = "0.11", features = ["blocking", "json"] }
-//   serde     = { version = "1", features = ["derive"] }
-//   serde_json = "1"
-//
-// Usage:
-//   cargo run --bin fetch_stock_data -- AAPL 2024-01-01 2026-03-09 YOUR_API_KEY
-//   cargo run --bin fetch_stock_data -- TSLA 2024-01-01 2026-03-09 YOUR_API_KEY
-//
-// Get a free API key at: https://twelvedata.com
+// Can still be run as a standalone binary:
+//   cargo run --bin generator -- AAPL 2024-01-01 2026-03-09 YOUR_API_KEY
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use std::collections::HashSet;
-use std::env;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::thread;
@@ -36,91 +26,73 @@ use std::time;
 // ─────────────────────────────────────────────
 
 const TWELVE_DATA_URL: &str = "https://api.twelvedata.com/time_series";
-
-// 8 seconds between calls to stay safely under the 8 calls/minute free tier limit
 const RATE_LIMIT_SECS: u64 = 8;
-
-// ~1950 rows = 5 trading days x ~390 minutes per day = one full week
 const POINTS_PER_CALL: usize = 1950;
 
 // ─────────────────────────────────────────────
-//  Data row
+//  Shared bar struct
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-struct Bar {
-    timestamp: String, // "YYYY-MM-DD HH:MM:SS"
-    symbol:    String,
-    open:      String,
-    high:      String,
-    low:       String,
-    close:     String,
-    volume:    String,
+/// Parsed OHLCV bar. Shared between cascade_trainer and scan_predict.
+#[derive(Clone, Debug)]
+pub struct StockData {
+    pub ts:     DateTime<Utc>,
+    pub open:   f64,
+    pub high:   f64,
+    pub low:    f64,
+    pub close:  f64,
+    pub volume: u64,
 }
 
 // ─────────────────────────────────────────────
 //  File helpers
 // ─────────────────────────────────────────────
 
-/// Returns the output filename for a ticker. e.g. "AAPL" -> "AAPL_data.csv"
-fn data_file_for(symbol: &str) -> String {
-    format!("{}_data.csv", symbol)
+/// Returns the canonical CSV filename for a symbol. e.g. "AAPL" -> "AAPL_data.csv"
+pub fn data_file_for(symbol: &str) -> String {
+    format!("{}_data.csv", symbol.to_uppercase())
 }
 
 /// Reads an existing CSV and returns all timestamps already saved.
-/// Used to decide whether a week needs downloading.
-fn load_existing_timestamps(filepath: &str) -> HashSet<String> {
+pub fn load_existing_timestamps(filepath: &str) -> HashSet<String> {
     let mut timestamps = HashSet::new();
-
-    if !Path::new(filepath).exists() {
-        return timestamps;
-    }
-
-    let file = match File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => return timestamps,
-    };
-
+    if !Path::new(filepath).exists() { return timestamps; }
+    let file = match File::open(filepath) { Ok(f) => f, Err(_) => return timestamps };
     for (i, line) in BufReader::new(file).lines().enumerate() {
-        if i == 0 { continue; } // skip header
+        if i == 0 { continue; }
         if let Ok(line) = line {
-            // Timestamp is the first column
             if let Some(ts) = line.split(',').next() {
-                timestamps.insert(ts.trim().to_string());
+                let ts = ts.trim();
+                timestamps.insert(ts.to_string());
+                // Also insert the date-only prefix so week_already_downloaded
+                // can check with a cheap HashSet lookup instead of a linear scan.
+                if ts.len() >= 10 {
+                    timestamps.insert(ts[..10].to_string());
+                }
             }
         }
     }
-
-    println!("  Found {} existing rows in {}", timestamps.len(), filepath);
+    println!("  Found {} existing rows in {}", timestamps.len() / 2, filepath);
     timestamps
 }
 
-/// Returns true if the given Monday's data is already in the file.
-/// Checks the first 10 minutes of the trading day (13:30–13:39 UTC = 09:30 ET).
-fn week_already_downloaded(monday: NaiveDate, existing: &HashSet<String>) -> bool {
-    for minute in 0..10_u32 {
-        let hour   = 13_u32;
-        let min    = 30 + minute;
-        let ts_str = format!("{} {:02}:{:02}:00", monday, hour, min);
-        if existing.contains(&ts_str) {
+/// Returns true if the given week is already in the file.
+/// Checks Mon–Fri date prefixes — avoids false misses on holidays or non-standard open times.
+pub fn week_already_downloaded(monday: NaiveDate, existing: &HashSet<String>) -> bool {
+    for day_offset in 0..5 {
+        let day = monday + Duration::days(day_offset);
+        if existing.contains(&day.to_string()) {
             return true;
         }
     }
     false
 }
-
 /// Returns all Mondays between start and end dates inclusive.
-fn get_mondays(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
+pub fn get_mondays(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
     let mut mondays = Vec::new();
-    // Advance to first Monday
     let mut current = start;
-    while current.weekday().num_days_from_monday() != 0 {
-        current += Duration::days(1);
-    }
-    while current <= end {
-        mondays.push(current);
-        current += Duration::weeks(1);
-    }
+    while current.weekday().num_days_from_monday() != 0 { current += Duration::days(1); }
+    while current <= end { mondays.push(current); current += Duration::weeks(1); }
     mondays
 }
 
@@ -128,148 +100,338 @@ fn get_mondays(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
 //  API call
 // ─────────────────────────────────────────────
 
-/// Makes one API call to fetch one week of 1-minute bars starting on `monday`.
-/// Returns a Vec of Bar rows, or empty Vec on error.
-fn fetch_week(symbol: &str, monday: NaiveDate, api_key: &str) -> Vec<Bar> {
+/// Fetches one week of 1-minute bars from Twelve Data.
+/// Returns rows as [timestamp, symbol, open, high, low, close, volume] string arrays,
+/// sorted oldest-first. Returns empty vec on any error.
+pub fn fetch_week(symbol: &str, monday: NaiveDate, api_key: &str) -> Vec<[String; 7]> {
     let friday    = monday + Duration::days(4);
-    let start_str = format!("{} 00:00:00", monday);
-    let end_str   = format!("{} 23:59:59", friday);
-
+    let start_str = format!("{} 00:00:00", monday).replace(' ', "%20");
+    let end_str   = format!("{} 23:59:59", friday).replace(' ', "%20");
     let url = format!(
-        "{}?symbol={}&interval=1min&start_date={}&end_date={}&outputsize={}&apikey={}&format=JSON&timezone=UTC",
-        TWELVE_DATA_URL,
-        symbol,
-        urlencoded(&start_str),
-        urlencoded(&end_str),
-        POINTS_PER_CALL,
-        api_key,
+        "{url}?symbol={sym}&interval=1min&start_date={s}&end_date={e}&outputsize={n}&apikey={k}&format=JSON&timezone=UTC",
+        url = TWELVE_DATA_URL, sym = symbol, s = start_str, e = end_str,
+        n = POINTS_PER_CALL, k = api_key
     );
-
-    let response = match reqwest::blocking::get(&url) {
-        Ok(r)  => r,
-        Err(e) => {
-            eprintln!("  Request failed: {}", e);
-            return vec![];
-        }
+    let resp = match reqwest::blocking::get(&url) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("  Request failed: {}", e); return vec![]; }
     };
-
-    let json: serde_json::Value = match response.json() {
-        Ok(j)  => j,
-        Err(e) => {
-            eprintln!("  Failed to parse JSON: {}", e);
-            return vec![];
-        }
+    let json: serde_json::Value = match resp.json() {
+        Ok(j) => j,
+        Err(e) => { eprintln!("  JSON parse error: {}", e); return vec![]; }
     };
-
-    // Check for API-level errors
     if json["status"] == "error" {
-        eprintln!("  API error: {}", json["message"].as_str().unwrap_or("unknown"));
-        return vec![];
+        eprintln!("  API error: {}", json["message"].as_str().unwrap_or("?")); return vec![];
     }
-
     let values = match json["values"].as_array() {
         Some(v) => v,
-        None    => {
-            println!("  No data returned (may be a holiday week)");
-            return vec![];
-        }
+        None => { println!("  No data (holiday week?)"); return vec![]; }
     };
-
-    let mut bars: Vec<Bar> = values.iter().map(|v| Bar {
-        timestamp: v["datetime"].as_str().unwrap_or("").to_string(),
-        symbol:    symbol.to_string(),
-        open:      v["open"].as_str().unwrap_or("0").to_string(),
-        high:      v["high"].as_str().unwrap_or("0").to_string(),
-        low:       v["low"].as_str().unwrap_or("0").to_string(),
-        close:     v["close"].as_str().unwrap_or("0").to_string(),
-        volume:    v["volume"].as_str().unwrap_or("0").to_string(),
+    let mut bars: Vec<[String; 7]> = values.iter().map(|v| {
+        let s = |k: &str| v[k].as_str().unwrap_or("0").to_string();
+        [s("datetime"), symbol.to_uppercase(), s("open"), s("high"), s("low"), s("close"), s("volume")]
     }).collect();
-
-    // Twelve Data returns newest-first — sort oldest-first to match our format
-    bars.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-
+    bars.sort_by(|a, b| a[0].cmp(&b[0]));
     bars
 }
 
-/// Minimal URL encoding for date strings (replaces spaces with %20)
-fn urlencoded(s: &str) -> String {
-    s.replace(' ', "%20")
+// ─────────────────────────────────────────────
+//  CSV helpers
+// ─────────────────────────────────────────────
+
+/// Merges new bars into the CSV, skipping any timestamps already present.
+/// Re-sorts and rewrites the whole file. Returns number of new rows added.
+pub fn save_bars(new_bars: &[[String; 7]], filepath: &str, existing: &HashSet<String>) -> usize {
+    let filtered: Vec<&[String; 7]> = new_bars.iter().filter(|b| !existing.contains(&b[0])).collect();
+    if filtered.is_empty() { println!("  All rows already present."); return 0; }
+    let mut all: Vec<Vec<String>> = Vec::new();
+    if Path::new(filepath).exists() {
+        let f = File::open(filepath).expect("open");
+        for (i, line) in BufReader::new(f).lines().enumerate() {
+            if i == 0 { continue; }
+            if let Ok(l) = line {
+                let cols: Vec<String> = l.split(',').map(|s| s.trim().to_string()).collect();
+                if cols.len() >= 7 { all.push(cols); }
+            }
+        }
+    }
+    for b in &filtered { all.push(b.to_vec()); }
+    all.sort_by(|a, b| a[0].cmp(&b[0]));
+    let mut f = File::create(filepath).expect("create");
+    writeln!(f, "Timestamp,Symbol,Open,High,Low,Close,Volume").unwrap();
+    for row in &all { writeln!(f, "{}", row.join(",")).unwrap(); }
+    println!("  Saved {} new rows  ({} total)", filtered.len(), all.len());
+    filtered.len()
+}
+
+/// Parse a CSV file into a Vec<StockData>.
+pub fn parse_csv(path: &str) -> Vec<StockData> {
+    let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open '{}': {}", path, e));
+    let mut rows = Vec::new();
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        if i == 0 { continue; }
+        let l = line.unwrap();
+        let c: Vec<&str> = l.split(',').collect();
+        if c.len() < 7 { continue; }
+        let ts = chrono::DateTime::parse_from_str(&format!("{} +0000", c[0]), "%Y-%m-%d %H:%M:%S %z")
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        rows.push(StockData {
+            ts,
+            open:   c[2].trim().parse().unwrap_or(0.0),
+            high:   c[3].trim().parse().unwrap_or(0.0),
+            low:    c[4].trim().parse().unwrap_or(0.0),
+            close:  c[5].trim().parse().unwrap_or(0.0),
+            volume: c[6].trim().parse().unwrap_or(0),
+        });
+    }
+    rows
+}
+
+/// Write a Vec<StockData> back to a CSV file (full rewrite, sorted).
+pub fn save_stock_data_to_csv(bars: &[StockData], path: &str, symbol: &str) {
+    let mut file = File::create(path)
+        .unwrap_or_else(|e| panic!("Cannot write '{}': {}", path, e));
+    writeln!(file, "Timestamp,Symbol,Open,High,Low,Close,Volume").unwrap();
+    for b in bars {
+        writeln!(file, "{},{},{:.4},{:.4},{:.4},{:.4},{}",
+            b.ts.format("%Y-%m-%d %H:%M:%S"),
+            symbol.to_uppercase(),
+            b.open, b.high, b.low, b.close, b.volume,
+        ).unwrap();
+    }
+    println!("  Saved {} bars to '{}'", bars.len(), path);
 }
 
 // ─────────────────────────────────────────────
-//  Save helpers
+//  maybe_download  (used by cascade_trainer)
+//
+//  Downloads a full date range week-by-week, skipping weeks already in the
+//  CSV. Returns the path of the (now populated) CSV.
 // ─────────────────────────────────────────────
 
-/// Saves new bars to the CSV file, skipping timestamps already present.
-/// Loads all existing rows, merges with new ones, sorts, and rewrites the file.
-/// Returns the number of new rows written.
-fn save_bars(new_bars: &[Bar], filepath: &str, existing: &HashSet<String>) -> usize {
-    // Filter to only rows we don't already have
-    let filtered: Vec<&Bar> = new_bars
-        .iter()
-        .filter(|b| !existing.contains(&b.timestamp))
-        .collect();
+pub fn maybe_download(symbol: &str, start: &str, end: &str, api_key: &str) -> String {
+    let filepath   = data_file_for(symbol);
+    let start_date = NaiveDate::parse_from_str(start, "%Y-%m-%d")
+        .expect("--start-date must be YYYY-MM-DD");
+    let end_date   = NaiveDate::parse_from_str(end, "%Y-%m-%d")
+        .expect("--end-date must be YYYY-MM-DD");
+    let today      = chrono::Local::now().date_naive();
+    let mut existing = load_existing_timestamps(&filepath);
+    let mondays      = get_mondays(start_date, end_date);
 
-    if filtered.is_empty() {
-        println!("  All rows already present, nothing to write.");
-        return 0;
+    println!("Auto-download: {} weeks to check for {}", mondays.len(), symbol);
+    let mut total_new = 0usize;
+    let mut calls     = 0usize;
+
+    for (i, &monday) in mondays.iter().enumerate() {
+        print!("[Week {:>3}/{}]  {}  ", i + 1, mondays.len(), monday);
+        if week_already_downloaded(monday, &existing) { println!("already downloaded."); continue; }
+        if monday > today { println!("future, skipping."); continue; }
+        println!("fetching...");
+        let bars = fetch_week(symbol, monday, api_key);
+        calls += 1;
+        if !bars.is_empty() {
+            let added = save_bars(&bars, &filepath, &existing);
+            total_new += added;
+            for b in &bars { existing.insert(b[0].clone()); }
+        }
+        let remaining = mondays[i + 1..].iter()
+            .filter(|&&m| !week_already_downloaded(m, &existing) && m <= today)
+            .count();
+        if remaining > 0 {
+            println!("  Waiting {}s (rate limit)...", RATE_LIMIT_SECS);
+            thread::sleep(time::Duration::from_secs(RATE_LIMIT_SECS));
+        }
     }
+    println!("Download complete: {} API calls, {} new rows, file: {}\n", calls, total_new, filepath);
+    filepath
+}
 
-    // Load existing rows from the file
-    let mut all_rows: Vec<Vec<String>> = Vec::new();
+// ─────────────────────────────────────────────
+//  ensure_data_for_date  (used by scan_predict --at path)
+//
+//  Checks whether a specific date is present in the CSV. If not, fetches
+//  every missing week up to that date and appends them.
+// ─────────────────────────────────────────────
 
-    if Path::new(filepath).exists() {
-        let file = File::open(filepath).expect("Cannot open file");
+pub fn ensure_data_for_date(symbol: &str, csv_path: &str, need_date: NaiveDate, api_key: &str) {
+    let mut existing_ts: HashSet<String> = HashSet::new();
+    let mut last_date: Option<NaiveDate> = None;
+
+    if Path::new(csv_path).exists() {
+        let file = File::open(csv_path).expect("Cannot open CSV");
         for (i, line) in BufReader::new(file).lines().enumerate() {
-            if i == 0 { continue; } // skip header
-            if let Ok(line) = line {
-                let cols: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
-                if cols.len() >= 7 {
-                    all_rows.push(cols);
+            if i == 0 { continue; }
+            if let Ok(l) = line {
+                if let Some(ts) = l.split(',').next() {
+                    let ts = ts.trim();
+                    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
+                        let d = dt.date();
+                        last_date = Some(last_date.map_or(d, |prev: NaiveDate| prev.max(d)));
+                        existing_ts.insert(d.to_string()); // date prefix for O(1) week check
+                    }
+                    existing_ts.insert(ts.to_string());
                 }
             }
         }
     }
 
-    // Add new rows
-    for bar in &filtered {
-        all_rows.push(vec![
-            bar.timestamp.clone(),
-            bar.symbol.clone(),
-            bar.open.clone(),
-            bar.high.clone(),
-            bar.low.clone(),
-            bar.close.clone(),
-            bar.volume.clone(),
-        ]);
+    if existing_ts.contains(&need_date.to_string()) { return; }
+
+    if api_key.is_empty() {
+        eprintln!("Error: no data for {} in '{}' and no --api-key provided.", need_date, csv_path);
+        eprintln!("  Pass --api-key so scan_predict can auto-download the missing data.");
+        std::process::exit(1);
     }
 
-    // Sort all rows by timestamp oldest-first
-    all_rows.sort_by(|a, b| a[0].cmp(&b[0]));
+    let need_monday = {
+        let days_from_mon = need_date.weekday().num_days_from_monday();
+        need_date - Duration::days(days_from_mon as i64)
+    };
 
-    // Write back to file
-    let mut file = File::create(filepath).expect("Cannot create file");
-    writeln!(file, "Timestamp,Symbol,Open,High,Low,Close,Volume").unwrap();
-    for row in &all_rows {
-        writeln!(file, "{}", row.join(",")).unwrap();
+    let start_monday = if let Some(ld) = last_date {
+        if ld >= need_date { return; }
+        let next_day  = ld + Duration::days(1);
+        let days_back = next_day.weekday().num_days_from_monday() as i64;
+        next_day - Duration::days(days_back)
+    } else {
+        need_monday
+    };
+
+    let mut mondays: Vec<NaiveDate> = Vec::new();
+    let mut cur = start_monday;
+    while cur <= need_monday { mondays.push(cur); cur += Duration::weeks(1); }
+
+    if mondays.is_empty() { return; }
+
+    println!("  Auto-downloading {} missing week(s) for {} ...", mondays.len(), symbol);
+
+    for (i, &monday) in mondays.iter().enumerate() {
+        println!("  Fetching week of {} ...", monday);
+        let new_raw = fetch_week(symbol, monday, api_key);
+        if !new_raw.is_empty() {
+            save_bars(&new_raw, csv_path, &existing_ts);
+            for b in &new_raw { existing_ts.insert(b[0].clone()); }
+        }
+        if i + 1 < mondays.len() {
+            println!("  Waiting {}s (rate limit)...", RATE_LIMIT_SECS);
+            thread::sleep(time::Duration::from_secs(RATE_LIMIT_SECS));
+        }
     }
-
-    println!(
-        "  Saved {} new rows  ({} total in file)",
-        filtered.len(),
-        all_rows.len()
-    );
-
-    filtered.len()
 }
 
 // ─────────────────────────────────────────────
-//  Main
+//  fetch_or_load  (used by scan_predict live path)
+//
+//  Smart loader: tries the local CSV first; if stale or absent, tops up
+//  from the Twelve Data API and rewrites the file.
+// ─────────────────────────────────────────────
+
+pub fn fetch_or_load(symbol: &str, n: usize, api_key: &str) -> Vec<StockData> {
+    let csv_path = data_file_for(symbol);
+
+    let mut existing: Vec<StockData> = if Path::new(&csv_path).exists() {
+        println!("  Found local database '{}'", csv_path);
+        let bars = parse_csv(&csv_path);
+        println!("  Loaded {} existing bars", bars.len());
+        bars
+    } else {
+        println!("  No local database found for {} — will download from API", symbol);
+        vec![]
+    };
+
+    let now_utc = Utc::now();
+    let needs_fetch = if let Some(last) = existing.last() {
+        let age = (now_utc - last.ts).num_seconds();
+        if age <= 120 {
+            println!("  Data is fresh (last bar {} — {}s ago). Skipping API call.",
+                last.ts.format("%Y-%m-%d %H:%M:%S UTC"), age);
+            false
+        } else {
+            println!("  Last bar: {}  ({}s ago — stale, fetching updates)",
+                last.ts.format("%Y-%m-%d %H:%M:%S UTC"), age);
+            true
+        }
+    } else {
+        true
+    };
+
+    if needs_fetch {
+        if api_key.is_empty() {
+            if existing.is_empty() {
+                panic!("No local data and no --api-key provided. Cannot fetch live data.");
+            }
+            println!("  No --api-key provided; using stale local data as-is.");
+        } else {
+            let new_bars = fetch_live_raw(symbol, n, api_key);
+            if !new_bars.is_empty() {
+                let existing_ts: HashSet<String> = existing.iter()
+                    .map(|b| b.ts.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .collect();
+                let mut added = 0usize;
+                for bar in new_bars {
+                    let ts_key = bar.ts.format("%Y-%m-%d %H:%M:%S").to_string();
+                    if !existing_ts.contains(&ts_key) { existing.push(bar); added += 1; }
+                }
+                existing.sort_by_key(|b| b.ts);
+                println!("  Merged {} new bars into local database ({} total)", added, existing.len());
+                save_stock_data_to_csv(&existing, &csv_path, symbol);
+            }
+        }
+    }
+
+    if existing.len() < n {
+        eprintln!("  ⚠  Only {} bars available (need {}). Accuracy may be reduced.", existing.len(), n);
+    }
+    existing
+}
+
+/// Raw API fetch — returns bars sorted oldest-first. Does not touch the filesystem.
+pub fn fetch_live_raw(symbol: &str, n: usize, api_key: &str) -> Vec<StockData> {
+    println!("  Fetching {} bars for {} from Twelve Data...", n, symbol);
+    let url = format!(
+        "https://api.twelvedata.com/time_series\
+         ?symbol={}&interval=1min&outputsize={}&apikey={}&format=JSON&timezone=UTC",
+        symbol, n, api_key
+    );
+    let resp = reqwest::blocking::get(&url)
+        .unwrap_or_else(|e| panic!("API request failed: {}", e));
+    let json: serde_json::Value = resp.json()
+        .unwrap_or_else(|e| panic!("Failed to parse API response: {}", e));
+    if json["status"] == "error" {
+        panic!("Twelve Data API error: {}", json["message"].as_str().unwrap_or("unknown"));
+    }
+    let values = json["values"].as_array()
+        .unwrap_or_else(|| panic!("No 'values' in API response — market may be closed"));
+    let mut bars: Vec<StockData> = values.iter().map(|v| {
+        let ts_str = v["datetime"].as_str().unwrap_or("");
+        let ts = chrono::DateTime::parse_from_str(&format!("{} +0000", ts_str), "%Y-%m-%d %H:%M:%S %z")
+            .map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
+        StockData {
+            ts,
+            open:   v["open"]  .as_str().unwrap_or("0").parse().unwrap_or(0.0),
+            high:   v["high"]  .as_str().unwrap_or("0").parse().unwrap_or(0.0),
+            low:    v["low"]   .as_str().unwrap_or("0").parse().unwrap_or(0.0),
+            close:  v["close"] .as_str().unwrap_or("0").parse().unwrap_or(0.0),
+            volume: v["volume"].as_str().unwrap_or("0").parse().unwrap_or(0),
+        }
+    }).collect();
+    bars.sort_by_key(|b| b.ts);
+    println!("  Got {} bars  ({} → {})",
+        bars.len(),
+        bars.first().map(|b| b.ts.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default(),
+        bars.last() .map(|b| b.ts.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default(),
+    );
+    bars
+}
+
+// ─────────────────────────────────────────────
+//  Standalone binary entry point
 // ─────────────────────────────────────────────
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-
+    let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
         eprintln!("Usage:   {} <SYMBOL> <START_DATE> <END_DATE> <API_KEY>", args[0]);
         eprintln!("Example: {} AAPL 2024-01-01 2026-03-09 your_key_here", args[0]);
@@ -277,79 +439,15 @@ fn main() {
         eprintln!("Get a free API key at: https://twelvedata.com");
         std::process::exit(1);
     }
-
-    let symbol     = args[1].to_uppercase();
-    let start_date = NaiveDate::parse_from_str(&args[2], "%Y-%m-%d")
-        .expect("Invalid start date. Use YYYY-MM-DD");
-    let end_date   = NaiveDate::parse_from_str(&args[3], "%Y-%m-%d")
-        .expect("Invalid end date. Use YYYY-MM-DD");
-    let api_key    = &args[4];
-    let filepath   = data_file_for(&symbol);
-    let today      = chrono::Local::now().date_naive();
-
-    println!("Symbol:  {}", symbol);
-    println!("Range:   {}  to  {}", start_date, end_date);
-    println!("File:    {}", filepath);
-    println!();
-
-    let mut existing = load_existing_timestamps(&filepath);
-    let mondays      = get_mondays(start_date, end_date);
-
-    println!("{} weeks to check\n", mondays.len());
-
-    let mut total_new  = 0_usize;
-    let mut calls_made = 0_usize;
-    let mut skipped    = 0_usize;
-
-    for (i, &monday) in mondays.iter().enumerate() {
-        print!("[Week {:>3}/{}]  {}  ", i + 1, mondays.len(), monday);
-
-        // Skip if already downloaded
-        if week_already_downloaded(monday, &existing) {
-            println!("already downloaded, skipping.");
-            skipped += 1;
-            continue;
-        }
-
-        // Skip future weeks
-        if monday > today {
-            println!("future date, skipping.");
-            skipped += 1;
-            continue;
-        }
-
-        println!("fetching...");
-        let bars = fetch_week(&symbol, monday, api_key);
-        calls_made += 1;
-
-        if !bars.is_empty() {
-            let added = save_bars(&bars, &filepath, &existing);
-            total_new += added;
-            // Update in-memory set so later weeks don't re-add the same rows
-            for bar in &bars {
-                existing.insert(bar.timestamp.clone());
-            }
-        }
-
-        // Rate limit — wait between calls (skip wait after the last call)
-        let remaining_needed = mondays[i + 1..].iter()
-            .filter(|&&m| !week_already_downloaded(m, &existing) && m <= today)
-            .count();
-
-        if remaining_needed > 0 {
-            println!("  Waiting {}s (rate limit)...", RATE_LIMIT_SECS);
-            thread::sleep(time::Duration::from_secs(RATE_LIMIT_SECS));
-        }
-    }
-
+    let symbol  = args[1].to_uppercase();
+    let start   = &args[2];
+    let end     = &args[3];
+    let api_key = &args[4];
+    let filepath = maybe_download(&symbol, start, end, api_key);
     println!();
     println!("{}", "=".repeat(45));
-    println!("Done.");
-    println!("  API calls made:  {}", calls_made);
-    println!("  Weeks skipped:   {}", skipped);
-    println!("  New rows added:  {}", total_new);
-    println!("  Output file:     {}", filepath);
+    println!("Done.  Output file: {}", filepath);
     println!();
     println!("To train:");
-    println!("  cargo run --bin stock_trainer -- {} {}_weights.csv", filepath, symbol);
+    println!("  cargo run --bin cascade_trainer -- {} --save-weights {}_weights", filepath, symbol);
 }

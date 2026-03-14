@@ -302,7 +302,7 @@ pub fn candle_body(bar: &Bar) -> f64 {
 /// Requires `bars.len() >= 27` (26-period MACD minimum).
 pub fn compute_indicators(bars: &[Bar]) -> [f64; INDICATOR_NF] {
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-    let n = closes.len();
+    let _n = closes.len();
 
     // ── Trend (EMA) ─────────────────────────────────────────────
     let ema9  = ema(&closes, 9);
@@ -388,3 +388,5 @@ pub fn bars_from_cascade(data: &[impl AsCascadeBar]) -> Vec<Bar> {
 pub trait AsCascadeBar {
     fn to_bar(&self) -> Bar;
 }
+
+fn main() {}

@@ -1,13 +1,10 @@
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, BufRead};
-use std::path::Path;
-use std::thread;
+use std::fs;
+use std::io;
 use std::time::Instant;
 
 // ─────────────────────────────────────────────
@@ -133,6 +130,7 @@ impl TuningTracker {
             ("LR 2",        format!("{}", cfg.lr2)),
             ("LR 3",        format!("{}", cfg.lr3)),
             ("LR Decay",    format!("{}", cfg.lr_decay)),
+            ("Bar Mins",    format!("{}", cfg.bar_mins)),
             ("Dir Weight",  format!("{}", cfg.dir_weight)),
             ("Layers",      format!("{}", cfg.layers)),
             ("Hidden",      format!("{}", cfg.hidden)),
@@ -313,7 +311,10 @@ struct Config {
     lr_decay: f64,
     epochs1: usize, epochs2: usize, epochs3: usize,
     lr1: f64, lr2: f64, lr3: f64,
+    bar_mins: usize,   // candle size in minutes (1 = 1-min bars, 5 = 5-min bars)
     dir_weight: f64,   // directional penalty weight (0.0 = pure MSE, 0.3 = default)
+    l2_lambda: f64,    // L2 weight decay — penalises large weights to reduce overfitting
+    early_stop_patience: usize, // stop training if directional acc doesn't improve for N epochs
     out_prefix: String,
 }
 
@@ -322,8 +323,14 @@ impl Default for Config {
         Self {
             lookback: 60, hidden: 128, layers: 2, batch_size: 256, lr_decay: 0.997,
             epochs1: 300, epochs2: 300, epochs3: 300,
-            lr1: 0.001, lr2: 0.001, lr3: 0.001,
-            dir_weight: 0.3,
+            lr1: 3e-4, lr2: 3e-4, lr3: 3e-4,
+            // dir_weight scales the MSE magnitude term relative to the BCE direction term.
+            // 1.5 keeps magnitude refinement meaningful without drowning the BCE signal.
+            // Old value of 0.3 let MSE dominate once hinge cut off, causing the 49% plateau.
+            bar_mins: 5,
+            dir_weight: 1.5,
+            l2_lambda: 1e-4,
+            early_stop_patience: 15,
             out_prefix: "default".into(),
         }
     }
@@ -333,11 +340,7 @@ impl Default for Config {
 //  Neural Structures (Optimized)
 // ─────────────────────────────────────────────
 
-#[derive(Clone)]
-struct StockData {
-    _ts: DateTime<Utc>,
-    open: f64, high: f64, low: f64, close: f64, volume: u64,
-}
+
 
 // ─────────────────────────────────────────────
 //  Technical indicators — 18 pre-computed market signals
@@ -502,6 +505,38 @@ fn compute_indicators(data: &[StockData]) -> [f64; INDICATOR_NF] {
 
 const NF: usize = 7;
 
+
+// ─────────────────────────────────────────────
+//  Resampling — collapse 1-min bars into N-min bars
+// ─────────────────────────────────────────────
+
+fn resample(data: Vec<StockData>, interval_mins: usize) -> Vec<StockData> {
+    if interval_mins <= 1 { return data; }
+    let mut out = Vec::with_capacity(data.len() / interval_mins + 1);
+    let mut i = 0;
+    while i < data.len() {
+        let anchor_ts = data[i].ts;
+        // Collect all bars within this interval window
+        let mut j = i;
+        while j < data.len() {
+            let mins = (data[j].ts - anchor_ts).num_minutes();
+            if mins < 0 || mins >= interval_mins as i64 { break; }
+            j += 1;
+        }
+        let slice = &data[i..j];
+        if slice.is_empty() { i += 1; continue; }
+        out.push(StockData {
+            ts:     slice[0].ts,
+            open:   slice[0].open,
+            high:   slice.iter().map(|b| b.high).fold(f64::NEG_INFINITY, f64::max),
+            low:    slice.iter().map(|b| b.low).fold(f64::INFINITY, f64::min),
+            close:  slice.last().unwrap().close,
+            volume: slice.iter().map(|b| b.volume).sum(),
+        });
+        i = j;
+    }
+    out
+}
 #[inline(always)]
 fn extract(cur: &StockData, prev: &StockData) -> [f64; NF] {
     let eps = 1e-8;
@@ -513,7 +548,7 @@ fn extract(cur: &StockData, prev: &StockData) -> [f64; NF] {
         ((cur.close - cur.open) / cc).clamp(-0.05, 0.05),
         ((cur.high - cc) / cc).clamp(0.0, 0.05),
         ((cc - cur.low) / cc).clamp(0.0, 0.05),
-        ((cur.volume as f64 - pv) / pv).clamp(-3.0, 3.0),
+        ((cur.volume as f64 - pv) / pv).clamp(-1.0, 1.0),
         ((cur.high - cur.low) / cc).clamp(0.0, 0.05),
         ((cur.open - pc) / pc).clamp(-0.05, 0.05),
     ]
@@ -540,7 +575,13 @@ struct Layer {
 
 impl Layer {
     fn new(in_size: usize, out_size: usize, is_output: bool, rng: &mut u64) -> Self {
-        let limit = (6.0_f64 / (in_size + out_size) as f64).sqrt();
+        // Output layer uses tiny init so predictions start near zero (targets are ±0.05).
+        // Hidden layers use Xavier uniform for stable gradient flow.
+        let limit = if is_output {
+            0.01
+        } else {
+            (6.0_f64 / (in_size + out_size) as f64).sqrt()
+        };
         let w: Vec<f64> = (0..in_size * out_size).map(|_| lcg(rng) * 2.0 * limit - limit).collect();
         let mut s = Layer { in_size, out_size, w_t: vec![0.0; in_size * out_size], w, b: vec![0.0; out_size], is_output };
         s.sync_transpose();
@@ -554,7 +595,7 @@ impl Layer {
     fn forward(&self, inp: &[f64], out: &mut [f64]) {
         for o in 0..self.out_size {
             let off = o * self.in_size;
-            let mut z = self.b[o] + self.w[off..off + self.in_size].iter().zip(inp).map(|(&w, &x)| w * x).sum::<f64>();
+            let z = self.b[o] + self.w[off..off + self.in_size].iter().zip(inp).map(|(&w, &x)| w * x).sum::<f64>();
             out[o] = if self.is_output { z } else { z.tanh() };
         }
     }
@@ -631,13 +672,46 @@ impl Net {
             }
         }
 
+        // ── Class balance weights ─────────────────────────────────────────────
+        // Scan flat_targets to count up/down moves per target dimension.
+        // Upweight the minority class so the model doesn't learn to always predict
+        // the majority direction (bullish bias when training on trending data).
+        println!("  Class balance scan for '{}':", name);
+        let class_weight_pairs: Vec<(f64, f64)> = (0..target_dim).map(|ti| {
+            let pos = (0..n_samples).filter(|&i| flat_targets[i*target_dim + ti] > 0.0).count();
+            let neg = (0..n_samples).filter(|&i| flat_targets[i*target_dim + ti] < 0.0).count();
+            let total = (pos + neg).max(1);
+            // Inverse frequency weighting: minority class gets weight > 1, majority < 1.
+            // Clamped to [0.5, 2.0] so a heavily skewed dataset can't destabilize training.
+            let pos_w = (neg as f64 / pos.max(1) as f64).clamp(0.5, 2.0);
+            let neg_w = (pos as f64 / neg.max(1) as f64).clamp(0.5, 2.0);
+            let _ = total;
+            println!("    +{}m  {}↑  {}↓  (up_w={:.3}  dn_w={:.3})",
+                (self.target_offsets[ti] + 1) * cfg.bar_mins, pos, neg, pos_w, neg_w);
+            (pos_w, neg_w)
+        }).collect();
+
         let ws_proto = Workspace::new(&self.layers, input_dim);
-        let mut lr = lr_init;
-        let start_time = Instant::now();
+        let mut lr;
         let mut history: Vec<EpochMetrics> = Vec::with_capacity(epochs);
 
         let warmup_epochs = (epochs / 10).max(5).min(20); // 10% of run, capped 5-20
         println!("━━━ Training {} ━━━  (warmup: {} epochs)", name, warmup_epochs);
+
+        // ── Early stopping state ──────────────────────────────────────────────
+        // Track best LOSS for weight restoration and early stop.
+        // Accuracy on tiny ±0.1% returns stays at ~49% regardless of training
+        // quality — MSE drives outputs toward 0 which has random directional
+        // accuracy. Tracking accuracy restores weights from epoch 11 (large
+        // chaotic outputs, ±26% predictions). Loss always improves meaningfully
+        // so we restore at lowest-MSE weights, giving small-magnitude predictions.
+        let mut best_loss: f64        = f64::MAX;
+        let mut epochs_no_improve     = 0usize;
+        let mut best_weights: Vec<(Vec<f64>, Vec<f64>)> =
+            self.layers.iter().map(|l| (l.w.clone(), l.b.clone())).collect();
+
+        // ── Shuffled index array — permuted each epoch ────────────────────────
+        let mut indices: Vec<usize> = (0..n_samples).collect();
 
         for epoch in 0..epochs {
             // ── Learning rate schedule ───────────────────────────────────────
@@ -651,11 +725,23 @@ impl Net {
                 lr_init * cfg.lr_decay.powi((epoch - warmup_epochs) as i32)
             };
             // ────────────────────────────────────────────────────────────────
+
+            // ── Fisher-Yates shuffle (deterministic but different each epoch) ─
+            {
+                let mut rng = epoch as u64 ^ 0xdeadbeef_cafe_u64;
+                for i in (1..n_samples).rev() {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let j = (rng >> 33) as usize % (i + 1);
+                    indices.swap(i, j);
+                }
+            }
+
             let epoch_start = Instant::now();
             let results = (0..n_samples).into_par_iter().step_by(cfg.batch_size)
                 .fold(|| (ws_proto.clone(), 0.0, 0), |(mut ws, mut mse, mut correct), b_start| {
                     let b_end = (b_start + cfg.batch_size).min(n_samples);
-                    for i in b_start..b_end {
+                    for pos in b_start..b_end {
+                        let i = indices[pos];
                         ws.acts[0].copy_from_slice(&flat_inputs[i*input_dim..(i+1)*input_dim]);
                         for (l, layer) in self.layers.iter().enumerate() {
                             let (left, right) = ws.acts.split_at_mut(l + 1);
@@ -665,17 +751,28 @@ impl Net {
                         let last_idx = self.layers.len();
                         for (k, (&p, &t)) in ws.acts[last_idx].iter().zip(targets).enumerate() {
                             let e = p - t;
-                            // Directional penalty: scaled by target magnitude so it stays
-                            // proportional to the MSE error regardless of target scale.
-                            // When signs disagree, push prediction toward the correct side
-                            // by dir_weight × |target| — this way a 0.001% target produces
-                            // a proportionally sized penalty, not a fixed 1.5 that drowns the signal.
+
+
+
+
+
+
+
+
+                            // MSE gradient + directional penalty (proportional to target magnitude).
+                            // dir_penalty pushes prediction toward the correct sign when wrong,
+                            // scaled by |t| so small targets produce small corrections and large
+                            // targets produce proportionally larger ones — no saturation, no explosion.
                             let dir_penalty = if p * t < 0.0 {
                                 cfg.dir_weight * t.abs() * t.signum() * -1.0
                             } else {
                                 0.0
                             };
-                            ws.errors[k] = e + dir_penalty;
+                            // Class balance: upweight minority direction
+                            let (pos_w, neg_w) = class_weight_pairs[k];
+                            let class_w = if t > 0.0 { pos_w } else { neg_w };
+
+                            ws.errors[k] = (e + dir_penalty) * class_w;
                             mse += e * e;
                             if (p > 0.0 && t > 0.0) || (p < 0.0 && t < 0.0) { correct += 1; }
                         }
@@ -683,9 +780,16 @@ impl Net {
                         for o in 0..self.layers[last_layer].out_size { ws.deltas[last_layer][o] = ws.errors[o]; }
                         for l in (0..last_layer).rev() {
                             let next = l + 1;
+                            let next_in  = self.layers[next].in_size;   // = layers[l].out_size
+                            let next_out = self.layers[next].out_size;
                             for o in 0..self.layers[l].out_size {
-                                let off = o * self.layers[next].out_size;
-                                let sum: f64 = self.layers[next].w_t[off..off + self.layers[next].out_size].iter().zip(&ws.deltas[next]).map(|(&w, &d)| w * d).sum();
+                                // Correct backprop: sum over every output neuron j of next
+                                // layer, using w[next][j * next_in + o]  (column o of W_next).
+                                // The old code used w_t[o * next_out .. o * next_out + next_out]
+                                // which was a *row* of w_t — i.e. a row of W — not a column.
+                                let sum: f64 = (0..next_out)
+                                    .map(|j| self.layers[next].w[j * next_in + o] * ws.deltas[next][j])
+                                    .sum();
                                 ws.deltas[l][o] = sum * (1.0 - ws.acts[l+1][o].powi(2));
                             }
                         }
@@ -708,12 +812,18 @@ impl Net {
                     (a.0, a.1 + b.1, a.2 + b.2)
                 });
 
-            // Apply Gradients
+            // ── Apply gradients with L2 weight decay ─────────────────────────
+            // L2 shrinks weights toward zero each step, preventing memorisation
+            // of training-sequence-specific patterns.
             for l in 0..self.layers.len() {
                 let in_s = self.layers[l].in_size;
+                let l2_factor = 1.0 - lr * cfg.l2_lambda;
                 for o in 0..self.layers[l].out_size {
                     let off = o * in_s;
-                    for idx in 0..in_s { self.layers[l].w[off+idx] -= lr * results.0.w_grad[l][off+idx] / n_samples as f64; }
+                    for idx in 0..in_s {
+                        self.layers[l].w[off+idx] = self.layers[l].w[off+idx] * l2_factor
+                            - lr * results.0.w_grad[l][off+idx] / n_samples as f64;
+                    }
                     self.layers[l].b[o] -= lr * results.0.b_grad[l][o] / n_samples as f64;
                 }
                 self.layers[l].sync_transpose();
@@ -723,6 +833,26 @@ impl Net {
             let accuracy   = (results.2 as f64 / (n_samples * target_dim) as f64) * 100.0;
             let epoch_secs = epoch_start.elapsed().as_secs_f64();
 
+            // ── Early stopping — track best loss ─────────────────────────────
+            if epoch >= warmup_epochs {
+                if epoch_loss < best_loss {
+                    best_loss = epoch_loss;
+                    epochs_no_improve = 0;
+                    best_weights = self.layers.iter().map(|l| (l.w.clone(), l.b.clone())).collect();
+                } else {
+                    epochs_no_improve += 1;
+                }
+                if cfg.early_stop_patience > 0 && epochs_no_improve >= cfg.early_stop_patience {
+                    let phase = "stopped";
+                    println!("  Epoch {:>3}/{:<3} | Loss: {:.8} | Acc: {:>5.2}% | lr: {:.2e} | {:.2}s/ep [{}]",
+                             epoch + 1, epochs, epoch_loss, accuracy, lr, epoch_secs, phase);
+                    println!("  ⏹  Early stop — no loss improvement for {} epochs (best loss {:.8})",
+                        cfg.early_stop_patience, best_loss);
+                    history.push(EpochMetrics { loss: epoch_loss, accuracy_pct: accuracy, epoch_secs });
+                    break;
+                }
+            }
+
             if (epoch + 1) % (epochs / 10).max(1) == 0 {
                 let phase = if epoch < warmup_epochs { "warmup" } else { "train " };
                 println!("  Epoch {:>3}/{:<3} | Loss: {:.8} | Acc: {:>5.2}% | lr: {:.2e} | {:.2}s/ep [{}]",
@@ -731,6 +861,15 @@ impl Net {
             }
             history.push(EpochMetrics { loss: epoch_loss, accuracy_pct: accuracy, epoch_secs });
         }
+
+        // ── Restore best weights found during training ────────────────────────
+        for (l, (w, b)) in self.layers.iter_mut().zip(best_weights) {
+            l.w = w;
+            l.b = b;
+            l.sync_transpose();
+        }
+        println!("  ✓ Restored best weights (loss {:.8})", best_loss);
+
         history
     }
 
@@ -832,170 +971,17 @@ fn save_all_weights(path: &str, cfg: &Config, scout: &Net, spotter: &Net, sniper
     println!("✅ Weights saved to: {}", path);
 }
 
-fn parse_csv(path: &str) -> Vec<StockData> {
-    let file = File::open(path).expect("Cannot open CSV");
-    let mut rows = Vec::new();
-    for (i, line) in io::BufReader::new(file).lines().enumerate() {
-        if i == 0 { continue; }
-        let l = line.unwrap();
-        let c: Vec<&str> = l.split(',').collect();
-        if c.len() < 7 { continue; }
-        let ts = chrono::DateTime::parse_from_str(&format!("{} +0000", c[0]), "%Y-%m-%d %H:%M:%S %z")
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        rows.push(StockData {
-            _ts: ts,
-            open:   c[1].trim().parse().unwrap_or(0.0),
-            high:   c[3].trim().parse().unwrap_or(0.0),
-            low:    c[4].trim().parse().unwrap_or(0.0),
-            close:  c[5].trim().parse().unwrap_or(0.0),
-            volume: c[6].trim().parse().unwrap_or(0),
-        });
-    }
-    rows
-}
+
 
 // ─────────────────────────────────────────────
 //  Main (CPU Limit Added Here)
-// ─────────────────────────────────────────────
-
 
 // ─────────────────────────────────────────────
-//  Auto-download: Twelve Data API
+//  Data fetching — delegated to generator module
 // ─────────────────────────────────────────────
 
-const TWELVE_DATA_URL: &str = "https://api.twelvedata.com/time_series";
-const RATE_LIMIT_SECS: u64  = 8;
-const POINTS_PER_CALL: usize = 1950;
-
-fn data_file_for(symbol: &str) -> String { format!("{}_data.csv", symbol) }
-
-fn load_existing_timestamps(filepath: &str) -> HashSet<String> {
-    let mut ts = HashSet::new();
-    if !Path::new(filepath).exists() { return ts; }
-    let file = match std::fs::File::open(filepath) { Ok(f) => f, Err(_) => return ts };
-    for (i, line) in io::BufReader::new(file).lines().enumerate() {
-        if i == 0 { continue; }
-        if let Ok(l) = line {
-            if let Some(t) = l.split(',').next() { ts.insert(t.trim().to_string()); }
-        }
-    }
-    println!("  Found {} existing rows in {}", ts.len(), filepath);
-    ts
-}
-
-fn week_already_downloaded(monday: NaiveDate, existing: &HashSet<String>) -> bool {
-    for minute in 0..10_u32 {
-        let ts = format!("{} 13:{:02}:00", monday, 30 + minute);
-        if existing.contains(&ts) { return true; }
-    }
-    false
-}
-
-fn get_mondays(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
-    let mut mondays = Vec::new();
-    let mut cur = start;
-    while cur.weekday().num_days_from_monday() != 0 { cur += Duration::days(1); }
-    while cur <= end { mondays.push(cur); cur += Duration::weeks(1); }
-    mondays
-}
-
-fn fetch_week(symbol: &str, monday: NaiveDate, api_key: &str) -> Vec<[String; 7]> {
-    let friday    = monday + Duration::days(4);
-    let start_str = format!("{} 00:00:00", monday).replace(' ', "%20");
-    let end_str   = format!("{} 23:59:59", friday).replace(' ', "%20");
-    let url = format!(
-        "{url}?symbol={sym}&interval=1min&start_date={s}&end_date={e}&outputsize={n}&apikey={k}&format=JSON&timezone=UTC",
-        url = TWELVE_DATA_URL, sym = symbol, s = start_str, e = end_str,
-        n = POINTS_PER_CALL, k = api_key
-    );
-    let resp = match reqwest::blocking::get(&url) {
-        Ok(r) => r, Err(e) => { eprintln!("  Request failed: {}", e); return vec![]; }
-    };
-    let json: serde_json::Value = match resp.json() {
-        Ok(j) => j, Err(e) => { eprintln!("  JSON parse error: {}", e); return vec![]; }
-    };
-    if json["status"] == "error" {
-        eprintln!("  API error: {}", json["message"].as_str().unwrap_or("?")); return vec![];
-    }
-    let values = match json["values"].as_array() {
-        Some(v) => v, None => { println!("  No data (holiday week?)"); return vec![]; }
-    };
-    let mut bars: Vec<[String; 7]> = values.iter().map(|v| {
-        let s = |k: &str| v[k].as_str().unwrap_or("0").to_string();
-        [s("datetime"), symbol.to_string(), s("open"), s("high"), s("low"), s("close"), s("volume")]
-    }).collect();
-    bars.sort_by(|a, b| a[0].cmp(&b[0]));
-    bars
-}
-
-fn save_bars(new_bars: &[[String; 7]], filepath: &str, existing: &HashSet<String>) -> usize {
-    let filtered: Vec<&[String; 7]> = new_bars.iter().filter(|b| !existing.contains(&b[0])).collect();
-    if filtered.is_empty() { println!("  All rows already present."); return 0; }
-    let mut all: Vec<Vec<String>> = Vec::new();
-    if Path::new(filepath).exists() {
-        let f = std::fs::File::open(filepath).expect("open");
-        for (i, line) in io::BufReader::new(f).lines().enumerate() {
-            if i == 0 { continue; }
-            if let Ok(l) = line {
-                let cols: Vec<String> = l.split(',').map(|s| s.trim().to_string()).collect();
-                if cols.len() >= 7 { all.push(cols); }
-            }
-        }
-    }
-    for b in &filtered { all.push(b.to_vec()); }
-    all.sort_by(|a, b| a[0].cmp(&b[0]));
-    let mut f = std::fs::File::create(filepath).expect("create");
-    use std::io::Write;
-    writeln!(f, "Timestamp,Symbol,Open,High,Low,Close,Volume").unwrap();
-    for row in &all { writeln!(f, "{}", row.join(",")).unwrap(); }
-    println!("  Saved {} new rows  ({} total)", filtered.len(), all.len());
-    filtered.len()
-}
-
-/// Download data if --start-date / --end-date / --api-key are provided.
-/// Returns the resolved CSV path to load (may be auto-generated).
-fn maybe_download(symbol: &str, start: &str, end: &str, api_key: &str) -> String {
-    let filepath = data_file_for(symbol);
-    let start_date = NaiveDate::parse_from_str(start, "%Y-%m-%d")
-        .expect("--start-date must be YYYY-MM-DD");
-    let end_date = NaiveDate::parse_from_str(end, "%Y-%m-%d")
-        .expect("--end-date must be YYYY-MM-DD");
-    let today    = chrono::Local::now().date_naive();
-    let mut existing = load_existing_timestamps(&filepath);
-    let mondays  = get_mondays(start_date, end_date);
-
-    println!("Auto-download: {} weeks to check for {}", mondays.len(), symbol);
-    let mut total_new = 0usize;
-    let mut calls     = 0usize;
-
-    for (i, &monday) in mondays.iter().enumerate() {
-        print!("[Week {:>3}/{}]  {}  ", i + 1, mondays.len(), monday);
-        if week_already_downloaded(monday, &existing) { println!("already downloaded."); continue; }
-        if monday > today { println!("future, skipping."); continue; }
-        println!("fetching...");
-        let bars = fetch_week(symbol, monday, api_key);
-        calls += 1;
-        if !bars.is_empty() {
-            let added = save_bars(&bars, &filepath, &existing);
-            total_new += added;
-            for b in &bars { existing.insert(b[0].clone()); }
-        }
-        let remaining = mondays[i + 1..].iter()
-            .filter(|&&m| !week_already_downloaded(m, &existing) && m <= today)
-            .count();
-        if remaining > 0 {
-            println!("  Waiting {}s (rate limit)...", RATE_LIMIT_SECS);
-            thread::sleep(std::time::Duration::from_secs(RATE_LIMIT_SECS));
-        }
-    }
-    println!("Download complete: {} API calls, {} new rows, file: {}\n", calls, total_new, filepath);
-    filepath
-}
-
-// ─────────────────────────────────────────────
-//  Main
-// ─────────────────────────────────────────────
+mod generator;
+use generator::{maybe_download, parse_csv, StockData};
 
 fn main() -> io::Result<()> {
     // Limit CPU to 75%
@@ -1006,6 +992,7 @@ fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("Usage: cascade_trainer <csv_or_symbol> [flags]");
+        println!("       cascade_trainer --symbols \"AAPL,MSFT,NVDA\" [flags]  (batch mode)");
         println!();
         println!("  Training flags:");
         println!("    --lookback N      Bars of history per model       [60]");
@@ -1015,24 +1002,39 @@ fn main() -> io::Result<()> {
         println!("    --lr1/2/3 F       Learning rate per stage         [0.001]");
         println!("    --lr-decay F      LR multiplier per epoch         [0.997]");
         println!("    --batch-size N    Samples per gradient update      [256]");
-        println!("    --dir-weight F    Directional penalty weight       [0.3]");
+        println!("    --dir-weight F    MSE magnitude weight vs BCE direction  [1.5]");
+        println!("    --l2-lambda F     L2 weight decay (0=off)          [1e-4]");
+        println!("    --early-stop N    Stop if acc flat for N epochs    [15]");
         println!("    --out-prefix S    Label for this run               [model]");
         println!("    --save-weights F  Save trained weights to this file");
+        println!();
+        println!("  Batch mode (trains multiple symbols sequentially):");
+        println!("    --symbols SYM1,SYM2,...  Comma-separated tickers");
+        println!("    Each symbol trains from {{SYM}}_data.csv → saves {{SYM}}.weights");
         println!();
         println!("  Auto-download flags (all three required together):");
         println!("    --start-date YYYY-MM-DD   History start date");
         println!("    --end-date   YYYY-MM-DD   History end date");
         println!("    --api-key    KEY           Twelve Data API key");
-        println!("    (first arg must be the ticker symbol, e.g. AAPL)");
+        println!("    (first arg must be the ticker symbol when not using --symbols)");
         println!();
-        println!("  Example (train only):");
-        println!("    cascade_trainer AAPL_data.csv --lookback 120 --hidden 256 --layers 2 \\");
-        println!("        --epochs1 50 --epochs2 50 --epochs3 50 --lr1 0.001 --dir-weight 1.5 \\");
-        println!("        --out-prefix AAPL");
+        println!("  Single symbol examples:");
+        println!("    cascade_trainer AAPL_data.csv --lookback 120 --hidden 128 --layers 3 \\");
+        println!("        --epochs1 75 --epochs2 75 --epochs3 75 --lr1 3e-4 \\");
+        println!("        --l2-lambda 1e-4 --early-stop 15 --out-prefix AAPL --save-weights AAPL.weights");
         println!();
-        println!("  Example (download + train):");
         println!("    cascade_trainer AAPL --start-date 2024-01-01 --end-date 2026-03-09 \\");
-        println!("        --api-key YOUR_KEY --lookback 120 --out-prefix AAPL");
+        println!("        --api-key YOUR_KEY --lookback 120 --out-prefix AAPL --save-weights AAPL.weights");
+        println!();
+        println!("  Batch mode examples:");
+        println!("    cascade_trainer . --symbols \"AAPL,MSFT,NVDA,TSLA,GOOGL\" \\");
+        println!("        --lookback 120 --hidden 128 --layers 3 \\");
+        println!("        --epochs1 75 --epochs2 75 --epochs3 75 --lr1 3e-4 \\");
+        println!("        --l2-lambda 1e-4 --early-stop 15");
+        println!();
+        println!("    cascade_trainer . --symbols \"AAPL,MSFT,NVDA,TSLA,GOOGL\" \\");
+        println!("        --start-date 2024-01-01 --end-date 2026-03-09 --api-key YOUR_KEY \\");
+        println!("        --lookback 120 --l2-lambda 1e-4 --early-stop 15");
         return Ok(());
     }
 
@@ -1047,31 +1049,179 @@ fn main() -> io::Result<()> {
     let mut end_date          = String::new();
     let mut api_key           = String::new();
     let mut save_weights_path = String::new();
+    let mut interval_mins: usize = 5;
+    let mut symbols_str:  String = String::new(); // --symbols "AAPL,MSFT,NVDA" for batch training
 
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--lookback"       => { cfg.lookback   = args[i+1].parse().unwrap(); i += 2; }
-            "--hidden"         => { cfg.hidden     = args[i+1].parse().unwrap(); i += 2; }
-            "--layers"         => { cfg.layers     = args[i+1].parse().unwrap(); i += 2; }
-            "--epochs1"        => { cfg.epochs1    = args[i+1].parse().unwrap(); i += 2; }
-            "--epochs2"        => { cfg.epochs2    = args[i+1].parse().unwrap(); i += 2; }
-            "--epochs3"        => { cfg.epochs3    = args[i+1].parse().unwrap(); i += 2; }
-            "--lr1"            => { cfg.lr1        = args[i+1].parse().unwrap(); i += 2; }
-            "--lr2"            => { cfg.lr2        = args[i+1].parse().unwrap(); i += 2; }
-            "--lr3"            => { cfg.lr3        = args[i+1].parse().unwrap(); i += 2; }
-            "--lr-decay"       => { cfg.lr_decay   = args[i+1].parse().unwrap(); i += 2; }
-            "--batch-size"     => { cfg.batch_size = args[i+1].parse().unwrap(); i += 2; }
-            "--dir-weight"     => { cfg.dir_weight = args[i+1].parse().unwrap(); i += 2; }
-            "--out-prefix"     => { cfg.out_prefix = args[i+1].clone();          i += 2; }
-            "--start-date"     => { start_date     = args[i+1].clone();          i += 2; }
-            "--end-date"       => { end_date        = args[i+1].clone();          i += 2; }
-            "--api-key"        => { api_key         = args[i+1].clone();          i += 2; }
-            "--save-weights"   => { save_weights_path = args[i+1].clone();       i += 2; }
-            _                  => { i += 1; }
+            "--lookback"          => { cfg.lookback             = args[i+1].parse().unwrap(); i += 2; }
+            "--hidden"            => { cfg.hidden               = args[i+1].parse().unwrap(); i += 2; }
+            "--layers"            => { cfg.layers               = args[i+1].parse().unwrap(); i += 2; }
+            "--epochs1"           => { cfg.epochs1              = args[i+1].parse().unwrap(); i += 2; }
+            "--epochs2"           => { cfg.epochs2              = args[i+1].parse().unwrap(); i += 2; }
+            "--epochs3"           => { cfg.epochs3              = args[i+1].parse().unwrap(); i += 2; }
+            "--lr1"               => { cfg.lr1                  = args[i+1].parse().unwrap(); i += 2; }
+            "--lr2"               => { cfg.lr2                  = args[i+1].parse().unwrap(); i += 2; }
+            "--lr3"               => { cfg.lr3                  = args[i+1].parse().unwrap(); i += 2; }
+            "--lr-decay"          => { cfg.lr_decay             = args[i+1].parse().unwrap(); i += 2; }
+            "--batch-size"        => { cfg.batch_size           = args[i+1].parse().unwrap(); i += 2; }
+            "--dir-weight"        => { cfg.dir_weight           = args[i+1].parse().unwrap(); i += 2; }
+            "--l2-lambda"         => { cfg.l2_lambda            = args[i+1].parse().unwrap(); i += 2; }
+            "--early-stop"        => { cfg.early_stop_patience  = args[i+1].parse().unwrap(); i += 2; }
+            "--out-prefix"        => { cfg.out_prefix           = args[i+1].clone();          i += 2; }
+            "--start-date"        => { start_date               = args[i+1].clone();          i += 2; }
+            "--end-date"          => { end_date                 = args[i+1].clone();          i += 2; }
+            "--api-key"           => { api_key                  = args[i+1].clone();          i += 2; }
+            "--save-weights"      => { save_weights_path        = args[i+1].clone();          i += 2; }
+            "--interval"          => { interval_mins = args[i+1].parse().unwrap_or(5); cfg.bar_mins = interval_mins; i += 2; }
+            "--symbols"           => { symbols_str              = args[i+1].clone();          i += 2; }
+            _                     => { i += 1; }
         }
     }
     fs::write("trainer_config.json", serde_json::to_string_pretty(&cfg).unwrap()).ok();
+
+    // ── Multi-symbol batch training mode ─────────────────────────────────────
+    // Usage: cascade_trainer --symbols "AAPL,MSFT,NVDA,TSLA,GOOGL" [shared flags]
+    //        --start-date 2024-01-01 --end-date 2026-03-09 --api-key KEY
+    //
+    // For each symbol, this will:
+    //   1. Download (or reuse) {SYM}_data.csv
+    //   2. Train Scout → Spotter → Sniper with the shared config
+    //   3. Save weights to {SYM}.weights
+    //
+    // The first positional arg is ignored in this mode — supply a placeholder
+    // like "." or just omit it by using the flag form shown above.
+    cfg.bar_mins = interval_mins;
+    if !symbols_str.is_empty() {
+        let sym_list: Vec<&str> = symbols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        println!("━━━ Batch training {} symbols: {} ━━━", sym_list.len(), sym_list.join(", "));
+
+        for sym in &sym_list {
+            let sym_upper = sym.to_uppercase();
+            println!("\n{}", "═".repeat(60));
+            println!("  Symbol: {}  ({}/{})", sym_upper, sym_list.iter().position(|s| s == sym).unwrap_or(0) + 1, sym_list.len());
+            println!("{}", "═".repeat(60));
+
+            // ── Resolve CSV — download if date range + key provided ───────────
+            let csv_path = if !start_date.is_empty() && !end_date.is_empty() && !api_key.is_empty() {
+                maybe_download(&sym_upper, &start_date, &end_date, &api_key)
+            } else {
+                let auto = format!("{}_data.csv", sym_upper);
+                if std::path::Path::new(&auto).exists() {
+                    auto
+                } else {
+                    eprintln!("  ⚠  Skipping {} — no data file and no --api-key/--start-date/--end-date provided", sym_upper);
+                    continue;
+                }
+            };
+
+            println!("  Loading {} ...", csv_path);
+            let data = {
+                let raw = parse_csv(&csv_path);
+                if interval_mins > 1 {
+                    println!("  Resampling to {}-min bars...", interval_mins);
+                    let r = resample(raw, interval_mins);
+                    println!("  {} bars after resampling", r.len());
+                    r
+                } else { raw }
+            };
+            if data.len() < cfg.lookback + 10 {
+                eprintln!("  ⚠  Skipping {} — only {} rows (need >= {})", sym_upper, data.len(), cfg.lookback + 10);
+                continue;
+            }
+            println!("  Loaded {} rows.", data.len());
+
+            // Per-symbol config: override prefix so weights file is named {SYM}.weights
+            let mut sym_cfg = cfg.clone();
+            sym_cfg.out_prefix = sym_upper.clone();
+
+            println!("  Precomputing technical indicators...");
+            let t_ind = Instant::now();
+            let indicators: Vec<[f64; INDICATOR_NF]> = (0..data.len())
+                .map(|i| { let start = i.saturating_sub(sym_cfg.lookback - 1); compute_indicators(&data[start..=i]) })
+                .collect();
+            println!("  Done in {:.2?} ({} snapshots)", t_ind.elapsed(), indicators.len());
+
+            let r_end   = data.len() - 10;
+            let train_d = &data[..r_end];
+            let live_w  = &data[r_end - sym_cfg.lookback..r_end];
+            let anchor  = live_w.last().unwrap().close;
+            let live_ind = &indicators[r_end - 1];
+
+            let mut scout = Net::new(vec![9], 0, &sym_cfg);
+            sym_cfg.bar_mins = interval_mins;
+            let scout_history = scout.train(train_d, &indicators, &format!("SCOUT (+{}m) [{}]", 10 * sym_cfg.bar_mins, sym_upper),
+                sym_cfg.epochs1, sym_cfg.lr1, &sym_cfg, |_| vec![]);
+            let s_val = scout.predict(live_w, live_ind, &[], anchor).get(&10).unwrap().0;
+
+            // Pre-compute per-sample cascade predictions (see single-symbol path for rationale).
+            let n_cascade = train_d.len().saturating_sub(sym_cfg.lookback + 9);
+            let scout_train_preds: Vec<f64> = (0..n_cascade).map(|i| {
+                let w   = &train_d[i..i + sym_cfg.lookback];
+                let ind = &indicators[i + sym_cfg.lookback - 1];
+                scout.predict(w, ind, &[], train_d[i + sym_cfg.lookback - 1].close)
+                     .get(&10).unwrap().0
+            }).collect();
+
+            let mut spotter = Net::new(vec![0, 4, 9], 1, &sym_cfg);
+            let spotter_history = spotter.train(train_d, &indicators, &format!("SPOTTER (+{},+{},+{}m) [{}]", sym_cfg.bar_mins, 5*sym_cfg.bar_mins, 10*sym_cfg.bar_mins, sym_upper),
+                sym_cfg.epochs2, sym_cfg.lr2, &sym_cfg,
+                |i| vec![scout_train_preds.get(i).copied().unwrap_or(0.0)]);
+            let sp_live = spotter.predict(live_w, live_ind, &[s_val], anchor);
+            let sp_v = [sp_live.get(&1).unwrap().0, sp_live.get(&5).unwrap().0, sp_live.get(&10).unwrap().0];
+
+            let spotter_train_preds: Vec<[f64; 3]> = (0..n_cascade).map(|i| {
+                let w   = &train_d[i..i + sym_cfg.lookback];
+                let ind = &indicators[i + sym_cfg.lookback - 1];
+                let sv  = scout_train_preds.get(i).copied().unwrap_or(0.0);
+                let sp  = spotter.predict(w, ind, &[sv], train_d[i + sym_cfg.lookback - 1].close);
+                [sp.get(&1).unwrap().0, sp.get(&5).unwrap().0, sp.get(&10).unwrap().0]
+            }).collect();
+
+            let mut sniper = Net::new((0..10).collect(), 4, &sym_cfg);
+            let sniper_history = sniper.train(train_d, &indicators, &format!("SNIPER (+{}..{}m) [{}]", sym_cfg.bar_mins, 10*sym_cfg.bar_mins, sym_upper),
+                sym_cfg.epochs3, sym_cfg.lr3, &sym_cfg, |i| {
+                    let sv = scout_train_preds.get(i).copied().unwrap_or(0.0);
+                    let sp = spotter_train_preds.get(i).copied().unwrap_or([0.0; 3]);
+                    vec![sv, sp[0], sp[1], sp[2]]
+                });
+            let sn_live = sniper.predict(live_w, live_ind, &[s_val, sp_v[0], sp_v[1], sp_v[2]], anchor);
+
+            // Always save to {SYM}.weights in batch mode
+            let weights_out = format!("{}.weights", sym_upper);
+            save_all_weights(&weights_out, &sym_cfg, &scout, &spotter, &sniper);
+
+            // Quick results preview
+            println!("━━━ [{}] Results (last 10 bars) ━━━━━━━━━━━━━━━━━━━━", sym_upper);
+            println!("  {:>4} | Sniper ({}-{})  | Actual", "Min", sym_cfg.bar_mins, 10*sym_cfg.bar_mins);
+            println!("  ----|------------------|--------");
+            for m in 1..=10 {
+                let actual_pct = (data[r_end + m - 1].close - anchor) / anchor;
+                let pred = sn_live.get(&m).map(|(p, d)| format!("{:>+6.3}% /${:<7.2}", p * 100.0, d))
+                    .unwrap_or("      --        ".into());
+                println!("  {:>4} | {:<16} | {:>+6.3}%", m * sym_cfg.bar_mins, pred, actual_pct * 100.0);
+            }
+
+            // Append to tuning log
+            let mut tracker = TuningTracker::new(&format!("AI_Tuning_Log_{}.xlsx", sym_upper));
+            let run_label = format!("lr={} l2={} es={} l={} h={} lb={}",
+                sym_cfg.lr1, sym_cfg.l2_lambda, sym_cfg.early_stop_patience,
+                sym_cfg.layers, sym_cfg.hidden, sym_cfg.lookback);
+            tracker.add_run("Scout",   RunRecord { run_label: run_label.clone(), cfg: sym_cfg.clone(), epochs: scout_history });
+            tracker.add_run("Spotter", RunRecord { run_label: run_label.clone(), cfg: sym_cfg.clone(), epochs: spotter_history });
+            tracker.add_run("Sniper",  RunRecord { run_label: run_label.clone(), cfg: sym_cfg.clone(), epochs: sniper_history });
+            match tracker.save() {
+                Ok(_)  => println!("📊 Excel charts saved to AI_Tuning_Log_{}.xlsx", sym_upper),
+                Err(e) => eprintln!("⚠  Could not save Excel for {}: {}", sym_upper, e),
+            }
+        }
+
+        println!("\n✅ Batch training complete. Weights saved:");
+        for sym in &sym_list { println!("   {}.weights", sym.to_uppercase()); }
+        return Ok(());
+    }
+    // ── End multi-symbol batch mode ───────────────────────────────────────────
 
     // Resolve CSV path — auto-download if date range + key are provided
     let csv_path = if !start_date.is_empty() && !end_date.is_empty() && !api_key.is_empty() {
@@ -1086,7 +1236,17 @@ fn main() -> io::Result<()> {
     println!("CPU capped at 75% ({}/{} threads)", cap, total_cores);
     println!("Loading {} ...", csv_path);
 
-    let data = parse_csv(&csv_path);
+    let data = {
+        let raw = parse_csv(&csv_path);
+        if interval_mins > 1 {
+            println!("Resampling from 1-min to {}-min bars...", interval_mins);
+            let resampled = resample(raw, interval_mins);
+            println!("  {} bars after resampling\n", resampled.len());
+            resampled
+        } else {
+            raw
+        }
+    };
     if data.len() < cfg.lookback + 10 {
         println!("Not enough data ({} rows, need >= {}).", data.len(), cfg.lookback + 10);
         return Ok(());
@@ -1111,11 +1271,23 @@ fn main() -> io::Result<()> {
     let live_ind = &indicators[r_end - 1];
 
     let mut scout = Net::new(vec![9], 0, &cfg);
-    let scout_history = scout.train(train_d, &indicators, "SCOUT (+10m)", cfg.epochs1, cfg.lr1, &cfg, |_| vec![]);
+    let scout_history = scout.train(train_d, &indicators, &format!("SCOUT (+{}m)", 10 * cfg.bar_mins), cfg.epochs1, cfg.lr1, &cfg, |_| vec![]);
     let s_val = scout.predict(live_w, live_ind, &[], anchor).get(&10).unwrap().0;
 
+    // Pre-compute Scout's prediction for every training sample so Spotter and Sniper
+    // receive a realistic, varying cascade signal during training rather than the single
+    // live value (which was a constant for all ~195k samples — defeating the cascade).
+    let n_cascade = train_d.len().saturating_sub(cfg.lookback + 9);
+    let scout_train_preds: Vec<f64> = (0..n_cascade).map(|i| {
+        let w   = &train_d[i..i + cfg.lookback];
+        let ind = &indicators[i + cfg.lookback - 1];
+        scout.predict(w, ind, &[], train_d[i + cfg.lookback - 1].close)
+             .get(&10).unwrap().0
+    }).collect();
+
     let mut spotter = Net::new(vec![0, 4, 9], 1, &cfg);
-    let spotter_history = spotter.train(train_d, &indicators, "SPOTTER (+1,+5,+10m)", cfg.epochs2, cfg.lr2, &cfg, |_| vec![s_val]);
+    let spotter_history = spotter.train(train_d, &indicators, &format!("SPOTTER (+{},+{},+{}m)", cfg.bar_mins, 5*cfg.bar_mins, 10*cfg.bar_mins), cfg.epochs2, cfg.lr2, &cfg,
+        |i| vec![scout_train_preds.get(i).copied().unwrap_or(0.0)]);
     let sp_live = spotter.predict(live_w, live_ind, &[s_val], anchor);
     let sp_v = [
         sp_live.get(&1).unwrap().0,
@@ -1123,8 +1295,21 @@ fn main() -> io::Result<()> {
         sp_live.get(&10).unwrap().0,
     ];
 
+    // Pre-compute Spotter's per-sample predictions for Sniper's cascade inputs.
+    let spotter_train_preds: Vec<[f64; 3]> = (0..n_cascade).map(|i| {
+        let w   = &train_d[i..i + cfg.lookback];
+        let ind = &indicators[i + cfg.lookback - 1];
+        let sv  = scout_train_preds.get(i).copied().unwrap_or(0.0);
+        let sp  = spotter.predict(w, ind, &[sv], train_d[i + cfg.lookback - 1].close);
+        [sp.get(&1).unwrap().0, sp.get(&5).unwrap().0, sp.get(&10).unwrap().0]
+    }).collect();
+
     let mut sniper = Net::new((0..10).collect(), 4, &cfg);
-    let sniper_history = sniper.train(train_d, &indicators, "SNIPER (+1..10m)", cfg.epochs3, cfg.lr3, &cfg, |_| vec![s_val, sp_v[0], sp_v[1], sp_v[2]]);
+    let sniper_history = sniper.train(train_d, &indicators, &format!("SNIPER (+{}..{}m)", cfg.bar_mins, 10*cfg.bar_mins), cfg.epochs3, cfg.lr3, &cfg, |i| {
+        let sv = scout_train_preds.get(i).copied().unwrap_or(0.0);
+        let sp = spotter_train_preds.get(i).copied().unwrap_or([0.0; 3]);
+        vec![sv, sp[0], sp[1], sp[2]]
+    });
     let sn_live = sniper.predict(live_w, live_ind, &[s_val, sp_v[0], sp_v[1], sp_v[2]], anchor);
 
     // Save weights if --save-weights was specified
@@ -1133,7 +1318,8 @@ fn main() -> io::Result<()> {
     }
 
     println!("━━━ [{}] Results ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", cfg.out_prefix);
-    println!("  Min | Scout (+10)      | Spotter (1,5,10) | Sniper (1-10)    | Actual");
+    println!("  {:>4} | Scout (+{:<2})     | Spotter ({},{},{}) | Sniper ({}-{})  | Actual",
+        "Min", 10*cfg.bar_mins, cfg.bar_mins, 5*cfg.bar_mins, 10*cfg.bar_mins, cfg.bar_mins, 10*cfg.bar_mins);
     println!("  ----|------------------|------------------|------------------|--------");
     for m in 1..=10 {
         let get_fmt = |map: &HashMap<usize, (f64, f64)>, min: usize| {
@@ -1142,8 +1328,8 @@ fn main() -> io::Result<()> {
                .unwrap_or("      --        ".into())
         };
         let actual_pct = (data[r_end + m - 1].close - anchor) / anchor;
-        println!("  {:>2}  | {:<16} | {:<16} | {:<16} | {:>+6.3}%",
-            m,
+        println!("  {:>4} | {:<16} | {:<16} | {:<16} | {:>+6.3}%",
+            m * cfg.bar_mins,
             get_fmt(&scout.predict(live_w, live_ind, &[], anchor), m),
             get_fmt(&sp_live, m),
             get_fmt(&sn_live, m),
@@ -1151,8 +1337,8 @@ fn main() -> io::Result<()> {
     }
 
     let mut tracker = TuningTracker::new("AI_Tuning_Log.xlsx");
-    let run_label = format!("lr={} decay={} dw={} l={} h={} lb={}",
-        cfg.lr1, cfg.lr_decay, cfg.dir_weight, cfg.layers, cfg.hidden, cfg.lookback);
+    let run_label = format!("lr={} l2={} es={} l={} h={} lb={}",
+        cfg.lr1, cfg.l2_lambda, cfg.early_stop_patience, cfg.layers, cfg.hidden, cfg.lookback);
     tracker.add_run("Scout",   RunRecord { run_label: run_label.clone(), cfg: cfg.clone(), epochs: scout_history });
     tracker.add_run("Spotter", RunRecord { run_label: run_label.clone(), cfg: cfg.clone(), epochs: spotter_history });
     tracker.add_run("Sniper",  RunRecord { run_label: run_label.clone(), cfg: cfg.clone(), epochs: sniper_history });

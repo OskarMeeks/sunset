@@ -316,6 +316,9 @@ struct Config {
     l2_lambda: f64,    // L2 weight decay — penalises large weights to reduce overfitting
     early_stop_patience: usize, // stop training if directional acc doesn't improve for N epochs
     out_prefix: String,
+    // Set to true when trained with --sniper-only so the predictor knows to pass zero cascade.
+    #[serde(default)]
+    sniper_only: bool,
 }
 
 impl Default for Config {
@@ -332,6 +335,7 @@ impl Default for Config {
             l2_lambda: 1e-4,
             early_stop_patience: 15,
             out_prefix: "default".into(),
+            sniper_only: false,
         }
     }
 }
@@ -571,19 +575,30 @@ struct Layer {
     in_size: usize, out_size: usize,
     w: Vec<f64>, w_t: Vec<f64>, b: Vec<f64>,
     is_output: bool,
+    // Adam first and second moment accumulators (weights + biases)
+    m_w: Vec<f64>, v_w: Vec<f64>,
+    m_b: Vec<f64>, v_b: Vec<f64>,
 }
 
 impl Layer {
     fn new(in_size: usize, out_size: usize, is_output: bool, rng: &mut u64) -> Self {
-        // Output layer uses tiny init so predictions start near zero (targets are ±0.05).
-        // Hidden layers use Xavier uniform for stable gradient flow.
+        // Output layer: tiny init so predictions start near 0.5 (sigmoid midpoint).
+        // Hidden layers: He init (sqrt(2/fan_in)) — correct for ReLU-family activations.
+        // Xavier (sqrt(6/(in+out))) is for tanh/sigmoid and underestimates the needed
+        // scale for leaky ReLU, contributing to dead neurons at init.
         let limit = if is_output {
             0.01
         } else {
-            (6.0_f64 / (in_size + out_size) as f64).sqrt()
+            (2.0_f64 / in_size as f64).sqrt()
         };
         let w: Vec<f64> = (0..in_size * out_size).map(|_| lcg(rng) * 2.0 * limit - limit).collect();
-        let mut s = Layer { in_size, out_size, w_t: vec![0.0; in_size * out_size], w, b: vec![0.0; out_size], is_output };
+        let n_w = in_size * out_size;
+        let mut s = Layer {
+            in_size, out_size, is_output,
+            w_t: vec![0.0; n_w], w, b: vec![0.0; out_size],
+            m_w: vec![0.0; n_w], v_w: vec![0.0; n_w],
+            m_b: vec![0.0; out_size], v_b: vec![0.0; out_size],
+        };
         s.sync_transpose();
         s
     }
@@ -596,7 +611,7 @@ impl Layer {
         for o in 0..self.out_size {
             let off = o * self.in_size;
             let z = self.b[o] + self.w[off..off + self.in_size].iter().zip(inp).map(|(&w, &x)| w * x).sum::<f64>();
-            out[o] = if self.is_output { z } else { z.tanh() };
+            out[o] = if self.is_output { 1.0 / (1.0 + (-z).exp()) } else if z > 0.0 { z } else { 0.01 * z }; // Leaky ReLU
         }
     }
 }
@@ -665,10 +680,7 @@ impl Net {
             flat_inputs[i*input_dim..(i+1)*input_dim].copy_from_slice(&inp);
             for (ti, &off) in self.target_offsets.iter().enumerate() {
                 let raw = (data[i+self.lookback+off].close - anchor) / anchor;
-                // Raw percentage change, clamped to ±5% — natural scale for 1-min bars,
-                // no ATR division which was blowing targets to ±8-9 and causing the
-                // network to collapse to predicting zero for everything.
-                flat_targets[i*target_dim + ti] = raw.clamp(-0.05, 0.05);
+                flat_targets[i*target_dim + ti] = if raw > 0.0 { 1.0 } else { 0.0 };
             }
         }
 
@@ -676,36 +688,48 @@ impl Net {
         // Scan flat_targets to count up/down moves per target dimension.
         // Upweight the minority class so the model doesn't learn to always predict
         // the majority direction (bullish bias when training on trending data).
-        println!("  Class balance scan for '{}':", name);
         let class_weight_pairs: Vec<(f64, f64)> = (0..target_dim).map(|ti| {
-            let pos = (0..n_samples).filter(|&i| flat_targets[i*target_dim + ti] > 0.0).count();
-            let neg = (0..n_samples).filter(|&i| flat_targets[i*target_dim + ti] < 0.0).count();
-            let total = (pos + neg).max(1);
+            let pos = (0..n_samples).filter(|&i| flat_targets[i*target_dim + ti] > 0.5).count();
+            let neg = n_samples - pos; // targets are 0.0 or 1.0; counting < 0.0 was always zero
             // Inverse frequency weighting: minority class gets weight > 1, majority < 1.
             // Clamped to [0.5, 2.0] so a heavily skewed dataset can't destabilize training.
             let pos_w = (neg as f64 / pos.max(1) as f64).clamp(0.5, 2.0);
             let neg_w = (pos as f64 / neg.max(1) as f64).clamp(0.5, 2.0);
-            let _ = total;
-            println!("    +{}m  {}↑  {}↓  (up_w={:.3}  dn_w={:.3})",
-                (self.target_offsets[ti] + 1) * cfg.bar_mins, pos, neg, pos_w, neg_w);
             (pos_w, neg_w)
         }).collect();
+        // Compact one-line balance summary
+        {
+            let (p0, n0) = { let p = (0..n_samples).filter(|&i| flat_targets[i*target_dim] > 0.5).count(); (p, n_samples - p) };
+            let balance_str = if target_dim == 1 {
+                format!("{}↑ {}↓", p0, n0)
+            } else {
+                let (pl, nl) = { let p = (0..n_samples).filter(|&i| flat_targets[i*target_dim + target_dim - 1] > 0.5).count(); (p, n_samples - p) };
+                format!("+{}m {}↑{}↓ … +{}m {}↑{}↓",
+                    (self.target_offsets[0] + 1) * cfg.bar_mins, p0, n0,
+                    (self.target_offsets[target_dim-1] + 1) * cfg.bar_mins, pl, nl)
+            };
+            println!("  Balance: {}  |  {} samples  |  {} outputs", balance_str, n_samples, target_dim);
+        }
 
         let ws_proto = Workspace::new(&self.layers, input_dim);
         let mut lr;
         let mut history: Vec<EpochMetrics> = Vec::with_capacity(epochs);
 
         let warmup_epochs = (epochs / 10).max(5).min(20); // 10% of run, capped 5-20
-        println!("━━━ Training {} ━━━  (warmup: {} epochs)", name, warmup_epochs);
+        println!("━━━ {} ━━━", name);
+        println!("  {:>6} │ {:>10} │ {:>7} │ {:>8} │ {:>5} │ {:>9} │ {:>9}",
+            "Epoch", "Loss", "Acc%", "LR", "s/ep", "h1 grad", "out grad");
+        println!("  {}┼{}┼{}┼{}┼{}┼{}┼{}",
+            "─".repeat(7), "─".repeat(12), "─".repeat(9), "─".repeat(10),
+            "─".repeat(7), "─".repeat(11), "─".repeat(10));
 
         // ── Early stopping state ──────────────────────────────────────────────
-        // Track best LOSS for weight restoration and early stop.
-        // Accuracy on tiny ±0.1% returns stays at ~49% regardless of training
-        // quality — MSE drives outputs toward 0 which has random directional
-        // accuracy. Tracking accuracy restores weights from epoch 11 (large
-        // chaotic outputs, ±26% predictions). Loss always improves meaningfully
-        // so we restore at lowest-MSE weights, giving small-magnitude predictions.
-        let mut best_loss: f64        = f64::MAX;
+        // Track best ACCURACY for weight restoration and early stop.
+        // With BCE loss, accuracy is the meaningful signal — loss continues to
+        // decrease even when accuracy plateaus (model becomes more confident about
+        // the same decisions). Tracking accuracy restores weights from the epoch
+        // where the model actually got the most directions right.
+        let mut best_acc: f64         = 0.0;
         let mut epochs_no_improve     = 0usize;
         let mut best_weights: Vec<(Vec<f64>, Vec<f64>)> =
             self.layers.iter().map(|l| (l.w.clone(), l.b.clone())).collect();
@@ -750,31 +774,24 @@ impl Net {
                         let targets = &flat_targets[i*target_dim..(i+1)*target_dim];
                         let last_idx = self.layers.len();
                         for (k, (&p, &t)) in ws.acts[last_idx].iter().zip(targets).enumerate() {
-                            let e = p - t;
+                            // Binary cross-entropy loss and gradient w.r.t. pre-sigmoid input.
+                            // p is the sigmoid output in (0,1); t is 0.0 (down) or 1.0 (up).
+                            // BCE = -(t*ln(p) + (1-t)*ln(1-p))
+                            // d(BCE)/d(pre_sigmoid) = p - t  (clean closed form, no saturation)
+                            let eps_bce = 1e-7_f64;
+                            let bce = -(t * (p + eps_bce).ln() + (1.0 - t) * (1.0 - p + eps_bce).ln());
 
 
 
 
-
-
-
-
-                            // MSE gradient + directional penalty (proportional to target magnitude).
-                            // dir_penalty pushes prediction toward the correct sign when wrong,
-                            // scaled by |t| so small targets produce small corrections and large
-                            // targets produce proportionally larger ones — no saturation, no explosion.
-                            let dir_penalty = if p * t < 0.0 {
-                                cfg.dir_weight * t.abs() * t.signum() * -1.0
-                            } else {
-                                0.0
-                            };
                             // Class balance: upweight minority direction
                             let (pos_w, neg_w) = class_weight_pairs[k];
-                            let class_w = if t > 0.0 { pos_w } else { neg_w };
+                            let class_w = if t > 0.5 { pos_w } else { neg_w };
 
-                            ws.errors[k] = (e + dir_penalty) * class_w;
-                            mse += e * e;
-                            if (p > 0.0 && t > 0.0) || (p < 0.0 && t < 0.0) { correct += 1; }
+                            // gradient of BCE through sigmoid simplifies to (p - t)
+                            ws.errors[k] = (p - t) * class_w;
+                            mse += bce;
+                            if (p > 0.5 && t > 0.5) || (p < 0.5 && t < 0.5) { correct += 1; }
                         }
                         let last_layer = last_idx - 1;
                         for o in 0..self.layers[last_layer].out_size { ws.deltas[last_layer][o] = ws.errors[o]; }
@@ -790,7 +807,7 @@ impl Net {
                                 let sum: f64 = (0..next_out)
                                     .map(|j| self.layers[next].w[j * next_in + o] * ws.deltas[next][j])
                                     .sum();
-                                ws.deltas[l][o] = sum * (1.0 - ws.acts[l+1][o].powi(2));
+                                ws.deltas[l][o] = sum * if ws.acts[l+1][o] > 0.0 { 1.0 } else { 0.01 }; // Leaky ReLU derivative
                             }
                         }
                         for l in 0..=last_layer {
@@ -812,19 +829,39 @@ impl Net {
                     (a.0, a.1 + b.1, a.2 + b.2)
                 });
 
-            // ── Apply gradients with L2 weight decay ─────────────────────────
-            // L2 shrinks weights toward zero each step, preventing memorisation
-            // of training-sequence-specific patterns.
+            // ── Apply gradients with Adam + L2 weight decay ──────────────────
+            // Adam maintains per-parameter momentum (m) and adaptive scale (v),
+            // giving much faster convergence than plain SGD on this problem.
+            // L2 is applied as weight decay before the Adam step (decoupled).
+            let adam_beta1 = 0.9_f64;
+            let adam_beta2 = 0.999_f64;
+            let adam_eps   = 1e-8_f64;
+            // Bias-correction factors for the current epoch (1-indexed)
+            let bc1 = 1.0 - adam_beta1.powi(epoch as i32 + 1);
+            let bc2 = 1.0 - adam_beta2.powi(epoch as i32 + 1);
+            let l2_factor = 1.0 - lr * cfg.l2_lambda;
             for l in 0..self.layers.len() {
                 let in_s = self.layers[l].in_size;
-                let l2_factor = 1.0 - lr * cfg.l2_lambda;
                 for o in 0..self.layers[l].out_size {
                     let off = o * in_s;
                     for idx in 0..in_s {
+                        let g = results.0.w_grad[l][off+idx] / n_samples as f64;
+                        let m = adam_beta1 * self.layers[l].m_w[off+idx] + (1.0 - adam_beta1) * g;
+                        let v = adam_beta2 * self.layers[l].v_w[off+idx] + (1.0 - adam_beta2) * g * g;
+                        self.layers[l].m_w[off+idx] = m;
+                        self.layers[l].v_w[off+idx] = v;
+                        let m_hat = m / bc1;
+                        let v_hat = v / bc2;
                         self.layers[l].w[off+idx] = self.layers[l].w[off+idx] * l2_factor
-                            - lr * results.0.w_grad[l][off+idx] / n_samples as f64;
+                            - lr * m_hat / (v_hat.sqrt() + adam_eps);
                     }
-                    self.layers[l].b[o] -= lr * results.0.b_grad[l][o] / n_samples as f64;
+                    // Bias — Adam without L2 (biases shouldn't be decayed)
+                    let gb = results.0.b_grad[l][o] / n_samples as f64;
+                    let mb = adam_beta1 * self.layers[l].m_b[o] + (1.0 - adam_beta1) * gb;
+                    let vb = adam_beta2 * self.layers[l].v_b[o] + (1.0 - adam_beta2) * gb * gb;
+                    self.layers[l].m_b[o] = mb;
+                    self.layers[l].v_b[o] = vb;
+                    self.layers[l].b[o] -= lr * (mb / bc1) / ((vb / bc2).sqrt() + adam_eps);
                 }
                 self.layers[l].sync_transpose();
             }
@@ -833,31 +870,33 @@ impl Net {
             let accuracy   = (results.2 as f64 / (n_samples * target_dim) as f64) * 100.0;
             let epoch_secs = epoch_start.elapsed().as_secs_f64();
 
-            // ── Early stopping — track best loss ─────────────────────────────
+            // ── Early stopping — track best accuracy ─────────────────────────
             if epoch >= warmup_epochs {
-                if epoch_loss < best_loss {
-                    best_loss = epoch_loss;
+                if accuracy > best_acc {
+                    best_acc = accuracy;
                     epochs_no_improve = 0;
                     best_weights = self.layers.iter().map(|l| (l.w.clone(), l.b.clone())).collect();
                 } else {
                     epochs_no_improve += 1;
                 }
                 if cfg.early_stop_patience > 0 && epochs_no_improve >= cfg.early_stop_patience {
-                    let phase = "stopped";
-                    println!("  Epoch {:>3}/{:<3} | Loss: {:.8} | Acc: {:>5.2}% | lr: {:.2e} | {:.2}s/ep [{}]",
-                             epoch + 1, epochs, epoch_loss, accuracy, lr, epoch_secs, phase);
-                    println!("  ⏹  Early stop — no loss improvement for {} epochs (best loss {:.8})",
-                        cfg.early_stop_patience, best_loss);
+                    // Compute h1/out grad norms for the stopped-epoch row
+                    let h1g = results.0.w_grad[0].iter().map(|&g| (g / n_samples as f64).powi(2)).sum::<f64>().sqrt();
+                    let og  = results.0.w_grad[self.layers.len()-1].iter().map(|&g| (g / n_samples as f64).powi(2)).sum::<f64>().sqrt();
+                    println!("  {:>3}/{:<3} │ {:>10.8} │ {:>6.2}% │ {:>8.2e} │ {:>5.2} │ {:>9.2e} │ {:>9.2e}  ⏹",
+                             epoch + 1, epochs, epoch_loss, accuracy, lr, epoch_secs, h1g, og);
+                    println!("  └─ early stop: no acc gain for {} epochs", cfg.early_stop_patience);
                     history.push(EpochMetrics { loss: epoch_loss, accuracy_pct: accuracy, epoch_secs });
                     break;
                 }
             }
 
             if (epoch + 1) % (epochs / 10).max(1) == 0 {
-                let phase = if epoch < warmup_epochs { "warmup" } else { "train " };
-                println!("  Epoch {:>3}/{:<3} | Loss: {:.8} | Acc: {:>5.2}% | lr: {:.2e} | {:.2}s/ep [{}]",
-                         epoch + 1, epochs, epoch_loss, accuracy, lr,
-                         epoch_secs, phase);
+                let tag = if epoch < warmup_epochs { "W" } else { " " };
+                let h1g = results.0.w_grad[0].iter().map(|&g| (g / n_samples as f64).powi(2)).sum::<f64>().sqrt();
+                let og  = results.0.w_grad[self.layers.len()-1].iter().map(|&g| (g / n_samples as f64).powi(2)).sum::<f64>().sqrt();
+                println!("  {:>3}/{:<3} │ {:>10.8} │ {:>6.2}% │ {:>8.2e} │ {:>5.2} │ {:>9.2e} │ {:>9.2e}  {}",
+                         epoch + 1, epochs, epoch_loss, accuracy, lr, epoch_secs, h1g, og, tag);
             }
             history.push(EpochMetrics { loss: epoch_loss, accuracy_pct: accuracy, epoch_secs });
         }
@@ -868,7 +907,33 @@ impl Net {
             l.b = b;
             l.sync_transpose();
         }
-        println!("  ✓ Restored best weights (loss {:.8})", best_loss);
+        // ── Post-train sanity: run 5 spread-out samples and report prediction spread.
+        //    A tiny std (< 0.01) means all outputs are identical → dead hidden layers.
+        let step = (n_samples / 5).max(1);
+        let sample_preds: Vec<f64> = (0..5).map(|ci| {
+            let i = (ci * step).min(n_samples - 1);
+            let mut acts = flat_inputs[i*input_dim..(i+1)*input_dim].to_vec();
+            for layer in &self.layers {
+                let mut out = vec![0.0f64; layer.out_size];
+                for o in 0..layer.out_size {
+                    let off = o * layer.in_size;
+                    let z = layer.b[o] + layer.w[off..off+layer.in_size].iter().zip(acts.iter()).map(|(&w,&x)| w*x).sum::<f64>();
+                    out[o] = if layer.is_output { 1.0/(1.0+(-z).exp()) } else if z > 0.0 { z } else { 0.01 * z }; // Leaky ReLU
+                }
+                acts = out;
+            }
+            acts[0] // first output neuron as representative
+        }).collect();
+        let p_mean = sample_preds.iter().sum::<f64>() / 5.0;
+        let p_std  = (sample_preds.iter().map(|&p| (p - p_mean).powi(2)).sum::<f64>() / 5.0).sqrt();
+        let p_min  = sample_preds.iter().cloned().fold(f64::INFINITY, f64::min);
+        let p_max  = sample_preds.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let spread_flag = if p_std < 0.005 { "  ⚠ outputs near-identical (dead layers?)" } else { "" };
+        println!("  {}┼{}┼{}┼{}┼{}┼{}┼{}",
+            "─".repeat(7), "─".repeat(12), "─".repeat(9), "─".repeat(10),
+            "─".repeat(7), "─".repeat(11), "─".repeat(10));
+        println!("  ✓ best acc {:.2}%  |  pred spread: min={:.3} max={:.3} std={:.4}{}",
+            best_acc, p_min, p_max, p_std, spread_flag);
 
         history
     }
@@ -885,10 +950,12 @@ impl Net {
             layer.forward(&left[l], &mut right[0]);
         }
         let preds = &ws.acts[self.layers.len()];
-        // Predictions are raw percentage changes — no ATR conversion needed
+        // BCE network outputs sigmoid probabilities in (0,1).
+        // Return (prob - 0.5, prob): first value is signed direction signal
+        // (positive = bullish, negative = bearish), second is raw probability.
         self.target_offsets.iter().enumerate().map(|(i, &off)| {
-            let pct = preds[i];
-            (off + 1, (pct, anchor * (1.0 + pct)))
+            let prob = preds[i];
+            (off + 1, (prob - 0.5, prob))
         }).collect()
     }
 
@@ -1051,6 +1118,7 @@ fn main() -> io::Result<()> {
     let mut save_weights_path = String::new();
     let mut interval_mins: usize = 5;
     let mut symbols_str:  String = String::new(); // --symbols "AAPL,MSFT,NVDA" for batch training
+    let mut sniper_only:   bool   = false;           // --sniper-only: skip Scout & Spotter, zero cascade
 
     let mut i = 2;
     while i < args.len() {
@@ -1076,6 +1144,7 @@ fn main() -> io::Result<()> {
             "--save-weights"      => { save_weights_path        = args[i+1].clone();          i += 2; }
             "--interval"          => { interval_mins = args[i+1].parse().unwrap_or(5); cfg.bar_mins = interval_mins; i += 2; }
             "--symbols"           => { symbols_str              = args[i+1].clone();          i += 2; }
+            "--sniper-only"       => { sniper_only = true;                                          i += 1; }
             _                     => { i += 1; }
         }
     }
@@ -1190,6 +1259,7 @@ fn main() -> io::Result<()> {
 
             // Always save to {SYM}.weights in batch mode
             let weights_out = format!("{}.weights", sym_upper);
+            sym_cfg.sniper_only = sniper_only;
             save_all_weights(&weights_out, &sym_cfg, &scout, &spotter, &sniper);
 
             // Quick results preview
@@ -1198,7 +1268,7 @@ fn main() -> io::Result<()> {
             println!("  ----|------------------|--------");
             for m in 1..=10 {
                 let actual_pct = (data[r_end + m - 1].close - anchor) / anchor;
-                let pred = sn_live.get(&m).map(|(p, d)| format!("{:>+6.3}% /${:<7.2}", p * 100.0, d))
+                let pred = sn_live.get(&m).map(|(p, d)| format!("p={:.3} ({:>+.3})", d, p))
                     .unwrap_or("      --        ".into());
                 println!("  {:>4} | {:<16} | {:>+6.3}%", m * sym_cfg.bar_mins, pred, actual_pct * 100.0);
             }
@@ -1270,39 +1340,53 @@ fn main() -> io::Result<()> {
     let anchor   = live_w.last().unwrap().close;
     let live_ind = &indicators[r_end - 1];
 
-    let mut scout = Net::new(vec![9], 0, &cfg);
-    let scout_history = scout.train(train_d, &indicators, &format!("SCOUT (+{}m)", 10 * cfg.bar_mins), cfg.epochs1, cfg.lr1, &cfg, |_| vec![]);
-    let s_val = scout.predict(live_w, live_ind, &[], anchor).get(&10).unwrap().0;
+    // ── sniper-only mode: skip Scout & Spotter, train Sniper with zeroed cascade inputs ──
+    let (mut scout, mut spotter, scout_history, spotter_history, s_val, sp_v, sp_live) =
+        if sniper_only {
+            println!("  [sniper-only] skipping Scout and Spotter — cascade inputs will be zero");
+            let dummy_scout   = Net::new(vec![9],        0, &cfg);
+            let dummy_spotter = Net::new(vec![0, 4, 9],  1, &cfg);
+            let dummy_sp_live = dummy_spotter.predict(live_w, live_ind, &[0.0], anchor);
+            (dummy_scout, dummy_spotter, vec![], vec![], 0.0_f64, [0.0_f64; 3], dummy_sp_live)
+        } else {
+            let mut scout = Net::new(vec![9], 0, &cfg);
+            let scout_history = scout.train(train_d, &indicators, &format!("SCOUT (+{}m)", 10 * cfg.bar_mins), cfg.epochs1, cfg.lr1, &cfg, |_| vec![]);
+            let s_val = scout.predict(live_w, live_ind, &[], anchor).get(&10).unwrap().0;
+            let n_cascade = train_d.len().saturating_sub(cfg.lookback + 9);
+            let scout_train_preds_tmp: Vec<f64> = (0..n_cascade).map(|i| {
+                let w   = &train_d[i..i + cfg.lookback];
+                let ind = &indicators[i + cfg.lookback - 1];
+                scout.predict(w, ind, &[], train_d[i + cfg.lookback - 1].close).get(&10).unwrap().0
+            }).collect();
+            let mut spotter = Net::new(vec![0, 4, 9], 1, &cfg);
+            let spotter_history = spotter.train(train_d, &indicators, &format!("SPOTTER (+{},+{},+{}m)", cfg.bar_mins, 5*cfg.bar_mins, 10*cfg.bar_mins), cfg.epochs2, cfg.lr2, &cfg,
+                |i| vec![scout_train_preds_tmp.get(i).copied().unwrap_or(0.0)]);
+            let sp_live = spotter.predict(live_w, live_ind, &[s_val], anchor);
+            let sp_v = [sp_live.get(&1).unwrap().0, sp_live.get(&5).unwrap().0, sp_live.get(&10).unwrap().0];
+            (scout, spotter, scout_history, spotter_history, s_val, sp_v, sp_live)
+        };
 
-    // Pre-compute Scout's prediction for every training sample so Spotter and Sniper
-    // receive a realistic, varying cascade signal during training rather than the single
-    // live value (which was a constant for all ~195k samples — defeating the cascade).
     let n_cascade = train_d.len().saturating_sub(cfg.lookback + 9);
-    let scout_train_preds: Vec<f64> = (0..n_cascade).map(|i| {
-        let w   = &train_d[i..i + cfg.lookback];
-        let ind = &indicators[i + cfg.lookback - 1];
-        scout.predict(w, ind, &[], train_d[i + cfg.lookback - 1].close)
-             .get(&10).unwrap().0
-    }).collect();
-
-    let mut spotter = Net::new(vec![0, 4, 9], 1, &cfg);
-    let spotter_history = spotter.train(train_d, &indicators, &format!("SPOTTER (+{},+{},+{}m)", cfg.bar_mins, 5*cfg.bar_mins, 10*cfg.bar_mins), cfg.epochs2, cfg.lr2, &cfg,
-        |i| vec![scout_train_preds.get(i).copied().unwrap_or(0.0)]);
-    let sp_live = spotter.predict(live_w, live_ind, &[s_val], anchor);
-    let sp_v = [
-        sp_live.get(&1).unwrap().0,
-        sp_live.get(&5).unwrap().0,
-        sp_live.get(&10).unwrap().0,
-    ];
-
-    // Pre-compute Spotter's per-sample predictions for Sniper's cascade inputs.
-    let spotter_train_preds: Vec<[f64; 3]> = (0..n_cascade).map(|i| {
-        let w   = &train_d[i..i + cfg.lookback];
-        let ind = &indicators[i + cfg.lookback - 1];
-        let sv  = scout_train_preds.get(i).copied().unwrap_or(0.0);
-        let sp  = spotter.predict(w, ind, &[sv], train_d[i + cfg.lookback - 1].close);
-        [sp.get(&1).unwrap().0, sp.get(&5).unwrap().0, sp.get(&10).unwrap().0]
-    }).collect();
+    let scout_train_preds: Vec<f64> = if sniper_only {
+        vec![0.0; n_cascade]
+    } else {
+        (0..n_cascade).map(|i| {
+            let w   = &train_d[i..i + cfg.lookback];
+            let ind = &indicators[i + cfg.lookback - 1];
+            scout.predict(w, ind, &[], train_d[i + cfg.lookback - 1].close).get(&10).unwrap().0
+        }).collect()
+    };
+    let spotter_train_preds: Vec<[f64; 3]> = if sniper_only {
+        vec![[0.0; 3]; n_cascade]
+    } else {
+        (0..n_cascade).map(|i| {
+            let w   = &train_d[i..i + cfg.lookback];
+            let ind = &indicators[i + cfg.lookback - 1];
+            let sv  = scout_train_preds.get(i).copied().unwrap_or(0.0);
+            let sp  = spotter.predict(w, ind, &[sv], train_d[i + cfg.lookback - 1].close);
+            [sp.get(&1).unwrap().0, sp.get(&5).unwrap().0, sp.get(&10).unwrap().0]
+        }).collect()
+    };
 
     let mut sniper = Net::new((0..10).collect(), 4, &cfg);
     let sniper_history = sniper.train(train_d, &indicators, &format!("SNIPER (+{}..{}m)", cfg.bar_mins, 10*cfg.bar_mins), cfg.epochs3, cfg.lr3, &cfg, |i| {
@@ -1314,26 +1398,38 @@ fn main() -> io::Result<()> {
 
     // Save weights if --save-weights was specified
     if !save_weights_path.is_empty() {
+        // Stamp the flag so the predictor knows not to run scout/spotter cascade.
+        cfg.sniper_only = sniper_only;
         save_all_weights(&save_weights_path, &cfg, &scout, &spotter, &sniper);
     }
 
     println!("━━━ [{}] Results ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", cfg.out_prefix);
-    println!("  {:>4} | Scout (+{:<2})     | Spotter ({},{},{}) | Sniper ({}-{})  | Actual",
-        "Min", 10*cfg.bar_mins, cfg.bar_mins, 5*cfg.bar_mins, 10*cfg.bar_mins, cfg.bar_mins, 10*cfg.bar_mins);
-    println!("  ----|------------------|------------------|------------------|--------");
-    for m in 1..=10 {
-        let get_fmt = |map: &HashMap<usize, (f64, f64)>, min: usize| {
-            map.get(&min)
-               .map(|(p, d)| format!("{:>+6.3}% /${:<7.2}", p * 100.0, d))
-               .unwrap_or("      --        ".into())
-        };
-        let actual_pct = (data[r_end + m - 1].close - anchor) / anchor;
-        println!("  {:>4} | {:<16} | {:<16} | {:<16} | {:>+6.3}%",
-            m * cfg.bar_mins,
-            get_fmt(&scout.predict(live_w, live_ind, &[], anchor), m),
-            get_fmt(&sp_live, m),
-            get_fmt(&sn_live, m),
-            actual_pct * 100.0);
+    if sniper_only {
+        println!("  {:>4} | Sniper ({}-{})  | Actual", "Min", cfg.bar_mins, 10*cfg.bar_mins);
+        println!("  ----|------------------|--------");
+        for m in 1..=10 {
+            let actual_pct = (data[r_end + m - 1].close - anchor) / anchor;
+            let pred = sn_live.get(&m).map(|&(p, d)| format!("p={:.3} ({:>+.3})", d, p)).unwrap_or("      --        ".into());
+            println!("  {:>4} | {:<16} | {:>+6.3}%", m * cfg.bar_mins, pred, actual_pct * 100.0);
+        }
+    } else {
+        println!("  {:>4} | Scout (+{:<2})     | Spotter ({},{},{}) | Sniper ({}-{})  | Actual",
+            "Min", 10*cfg.bar_mins, cfg.bar_mins, 5*cfg.bar_mins, 10*cfg.bar_mins, cfg.bar_mins, 10*cfg.bar_mins);
+        println!("  ----|------------------|------------------|------------------|--------");
+        for m in 1..=10 {
+            let get_fmt = |map: &HashMap<usize, (f64, f64)>, min: usize| {
+                map.get(&min)
+                   .map(|&(p, d)| format!("p={:.3} ({:>+.3})", d, p))
+                   .unwrap_or("      --        ".into())
+            };
+            let actual_pct = (data[r_end + m - 1].close - anchor) / anchor;
+            println!("  {:>4} | {:<16} | {:<16} | {:<16} | {:>+6.3}%",
+                m * cfg.bar_mins,
+                get_fmt(&scout.predict(live_w, live_ind, &[], anchor), m),
+                get_fmt(&sp_live, m),
+                get_fmt(&sn_live, m),
+                actual_pct * 100.0);
+        }
     }
 
     let mut tracker = TuningTracker::new("AI_Tuning_Log.xlsx");

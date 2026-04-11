@@ -77,6 +77,10 @@ struct Config {
     #[serde(default = "default_patience")]
     early_stop_patience: usize,
     out_prefix: String,
+    // If true, sniper was trained with zeroed cascade (scout/spotter skipped).
+    // Predictor must pass zeros rather than running the untrained dummy nets.
+    #[serde(default)]
+    sniper_only: bool,
 }
 
 fn default_l2()       -> f64   { 1e-4 }
@@ -89,7 +93,7 @@ impl Default for Config {
             epochs1: 300, epochs2: 300, epochs3: 300,
             lr1: 0.001, lr2: 0.001, lr3: 0.001,
             dir_weight: 0.3, l2_lambda: 1e-4, early_stop_patience: 15,
-            out_prefix: "model".into(),
+            out_prefix: "model".into(), sniper_only: false,
         }
     }
 }
@@ -461,7 +465,7 @@ impl Layer {
         for o in 0..self.out_size {
             let off = o*self.in_size;
             let z = self.b[o]+self.w[off..off+self.in_size].iter().zip(inp).map(|(&w,&x)|w*x).sum::<f64>();
-            out[o] = if self.is_output { z } else { z.tanh() };
+            out[o] = if self.is_output { 1.0 / (1.0 + (-z).exp()) } else if z > 0.0 { z } else { 0.01 * z };
         }
     }
 }
@@ -513,8 +517,11 @@ impl Net {
             acts.push(out);
         }
         let preds = acts.last().unwrap();
+        // BCE network outputs sigmoid probabilities in (0,1).
+        // Return (prob - 0.5, prob): first value is signed direction signal
+        // (positive = bullish, negative = bearish), second is raw probability.
         self.target_offsets.iter().enumerate()
-            .map(|(i,&off)| { let pct=preds[i]; (off+1,(pct, anchor*(1.0+pct))) })
+            .map(|(i,&off)| { let prob=preds[i]; (off+1,(prob - 0.5, prob)) })
             .collect()
     }
 }
@@ -553,7 +560,7 @@ impl Net {
         noise_std: f64,
     ) -> (f64, Vec<f64>) {
         let clean = self.forward_raw(inp);
-        let direction = clean[target_i] >= 0.0;
+        let direction = clean[target_i] >= 0.5;   // sigmoid output: > 0.5 = bullish
         let mut agree = 0usize;
         let mut pass_pcts: Vec<f64> = Vec::with_capacity(n_passes);
         let mut rng = 0xc0ffee_u64;
@@ -566,7 +573,7 @@ impl Net {
             }).collect();
             let out = self.forward_raw(&noisy)[target_i];
             pass_pcts.push(out);
-            if (out >= 0.0) == direction {
+            if (out >= 0.5) == direction {   // sigmoid threshold
                 agree += 1;
             }
         }
@@ -618,6 +625,7 @@ fn run_prediction(
     jitter_passes: usize,
     knn_k:         usize,
     noise_std:     f64,
+    cfg:           &Config,
 ) -> (usize, usize) { // (correct, total) directional calls
     if window.is_empty() { eprintln!("Window is empty — cannot predict."); return (0, 0); }
 
@@ -634,22 +642,58 @@ fn run_prediction(
 
     let live_ind = compute_indicators(window);
 
-    // ── Cascade inference ─────────────────────────────────────────────────────
-    let scout_map = scout.predict(window, &live_ind, &[], anchor);
-    let s_val     = scout_map.get(&10).map(|&(p,_)| p).unwrap_or(0.0);
+    // ── Diagnostic: raw indicator vector ─────────────────────────────────────
+    let ind_mean = live_ind.iter().sum::<f64>() / live_ind.len() as f64;
+    let ind_std  = (live_ind.iter().map(|&x|(x-ind_mean).powi(2)).sum::<f64>()/live_ind.len() as f64).sqrt();
+    println!("  [DIAG] Indicators  μ={:+.4}  σ={:.4}  vals: {}",
+        ind_mean, ind_std,
+        live_ind.iter().map(|&x| format!("{:+.3}",x)).collect::<Vec<_>>().join(" "));
 
-    let sp_map = spotter.predict(window, &live_ind, &[s_val], anchor);
-    let sp_v   = [
-        sp_map.get(&1) .map(|&(p,_)| p).unwrap_or(0.0),
-        sp_map.get(&5) .map(|&(p,_)| p).unwrap_or(0.0),
-        sp_map.get(&10).map(|&(p,_)| p).unwrap_or(0.0),
-    ];
+    // ── Cascade inference ─────────────────────────────────────────────────────
+    // If trained with --sniper-only, scout and spotter were never trained.
+    // Their random-init weights produce garbage outputs that would corrupt the
+    // sniper (which learned with zeroed cascade). Pass zeros unconditionally.
+    let (s_val, sp_v) = if cfg.sniper_only {
+        (0.0_f64, [0.0_f64; 3])
+    } else {
+        let scout_map = scout.predict(window, &live_ind, &[], anchor);
+        let s         = scout_map.get(&10).map(|&(p,_)| p).unwrap_or(0.0);
+        let sp_map    = spotter.predict(window, &live_ind, &[s], anchor);
+        let sp = [
+            sp_map.get(&1) .map(|&(p,_)| p).unwrap_or(0.0),
+            sp_map.get(&5) .map(|&(p,_)| p).unwrap_or(0.0),
+            sp_map.get(&10).map(|&(p,_)| p).unwrap_or(0.0),
+        ];
+        (s, sp)
+    };
+
+    // ── Diagnostic: per-layer activations for sniper ─────────────────────────
+    {
+        let cascade_tmp = vec![s_val, sp_v[0], sp_v[1], sp_v[2]];
+        let inp = sniper.build_input(window, &live_ind, &cascade_tmp);
+        let inp_mean = inp.iter().sum::<f64>() / inp.len() as f64;
+        let inp_std  = (inp.iter().map(|&x|(x-inp_mean).powi(2)).sum::<f64>()/inp.len() as f64).sqrt();
+        println!("  [DIAG] Sniper input μ={:+.5}  σ={:.5}  len={}", inp_mean, inp_std, inp.len());
+        let mut acts = inp;
+        for (li, layer) in sniper.layers.iter().enumerate() {
+            let mut out = vec![0.0f64; layer.out_size];
+            layer.forward(&acts, &mut out);
+            let amean = out.iter().sum::<f64>() / out.len() as f64;
+            let astd  = (out.iter().map(|&x|(x-amean).powi(2)).sum::<f64>()/out.len() as f64).sqrt();
+            let amin  = out.iter().cloned().fold(f64::INFINITY, f64::min);
+            let amax  = out.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let tag = if layer.is_output { "output".to_string() } else { format!("hidden{}", li+1) };
+            println!("  [DIAG] Sniper layer {:8}  n={}  μ={:+.5}  σ={:.5}  [{:.3},{:.3}]",
+                tag, out.len(), amean, astd, amin, amax);
+            acts = out;
+        }
+    }
 
     let sn_map = sniper.predict(window, &live_ind, &[s_val, sp_v[0], sp_v[1], sp_v[2]], anchor);
 
     let mut sniper_pct = [0.0f64; 10];
     for m in 1..=10 {
-        sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p.clamp(-0.05, 0.05)).unwrap_or(0.0);
+        sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p).unwrap_or(0.0);
     }
 
     // ── Familiarity (k-NN) — computed once, same for all minutes ─────────────
@@ -663,11 +707,7 @@ fn run_prediction(
     let mut confidences = [0.0f64; 10];
     let mut stabilities = [0.0f64; 10];
 
-    // Scale noise relative to output magnitude so jitter is meaningful regardless
-    // of how large or small the predictions are. Use 20% of the mean absolute output
-    // as the noise level, floored at noise_std so the flag still has effect.
-    let mean_abs_output = sniper_pct.iter().map(|p| p.abs()).sum::<f64>() / 10.0;
-    let effective_noise = (mean_abs_output * 0.20).max(noise_std);
+    let effective_noise = noise_std;
 
     // jitter_passes_data[m][pass] = raw prediction for minute m on noisy pass
     let mut jitter_passes_data: Vec<Vec<f64>> = Vec::with_capacity(10);
@@ -683,7 +723,8 @@ fn run_prediction(
         anchor_bar.ts.format("%Y-%m-%d %H:%M:%S"));
 
     let fmt_pred = |map: &HashMap<usize,(f64,f64)>, m: usize| -> String {
-        map.get(&m).map(|(p,d)| format!("{:>+6.3}% / ${:<8.4}", p*100.0, d))
+        // d = raw probability (0-1), p = prob-0.5 (signed direction signal)
+        map.get(&m).map(|&(p,d)| format!("p={:.3} ({:>+.3})", d, p))
            .unwrap_or_else(|| "       --         ".into())
     };
 
@@ -714,8 +755,10 @@ fn run_prediction(
         // Jitter pass columns: filled arrow = agrees with clean, hollow = disagrees
         let clean_bull = sniper_pct[m-1] >= 0.0;
         let pass_cols: String = jitter_passes_data[m-1][..show_passes].iter().map(|&p| {
-            let agrees = (p >= 0.0) == clean_bull;
-            format!(" {} ", if agrees { clean_dir(p) } else { if p >= 0.0 { "△" } else { "▽" } })
+            // jitter passes are raw sigmoid outputs (0-1), threshold at 0.5
+            let agrees = (p >= 0.5) == clean_bull;
+            format!(" {} ", if agrees { if p >= 0.5 { "▲" } else { "▼" } }
+                            else      { if p >= 0.5 { "△" } else { "▽" } })
         }).collect::<Vec<_>>().join("|");
 
         if has_actual {
@@ -777,12 +820,13 @@ fn run_prediction(
     println!();
     println!("  ─────────────────────────────────────────────────");
     println!("  Consensus   : {}  ({}/10 bars agree)", direction, bullish.max(10-bullish));
-    println!("  Avg Δ       : {:>+.4}%  over next 10 minutes", avg_pct*100.0);
+    println!("  Avg signal  : {:>+.4}  over next 10 minutes (0=neutral, ±0.5=max)", avg_pct);
     println!("  Avg conf    : {:.0}%  {}  {}  (stab {:.0}% × fam {:.0}%)",
         avg_conf*100.0, confidence_label(avg_conf), confidence_bar(avg_conf),
         avg_stab*100.0, familiarity*100.0);
-    println!("  +10m target : ${:.4}  ({:>+.4}%)",
-        p10_price, (p10_price-anchor)/anchor*100.0);
+    println!("  +10m prob   : {:.3}  ({} {:.1}% confidence)",
+        p10_price, if p10_price >= 0.5 { "▲ BULLISH" } else { "▼ BEARISH" },
+        (p10_price - 0.5).abs() * 200.0);
 
     let correct = if has_actual && future.len() >= 10 {
         (1..=10).filter(|&m| {
@@ -824,34 +868,38 @@ fn run_day_quiet(
     knn_k:         usize,
     noise_std:     f64,
     date:          NaiveDate,
+    cfg:           &Config,
 ) -> Option<DayResult> {
     if window.len() < 2 { return None; }
 
     let anchor     = window.last().unwrap().close;
     let live_ind   = compute_indicators(window);
 
-    let scout_map  = scout.predict(window, &live_ind, &[], anchor);
-    let s_val      = scout_map.get(&10).map(|&(p,_)| p).unwrap_or(0.0);
-
-    let sp_map     = spotter.predict(window, &live_ind, &[s_val], anchor);
-    let sp_v       = [
-        sp_map.get(&1) .map(|&(p,_)| p).unwrap_or(0.0),
-        sp_map.get(&5) .map(|&(p,_)| p).unwrap_or(0.0),
-        sp_map.get(&10).map(|&(p,_)| p).unwrap_or(0.0),
-    ];
+    let (s_val, sp_v) = if cfg.sniper_only {
+        (0.0_f64, [0.0_f64; 3])
+    } else {
+        let scout_map = scout.predict(window, &live_ind, &[], anchor);
+        let s         = scout_map.get(&10).map(|&(p,_)| p).unwrap_or(0.0);
+        let sp_map    = spotter.predict(window, &live_ind, &[s], anchor);
+        let sp = [
+            sp_map.get(&1) .map(|&(p,_)| p).unwrap_or(0.0),
+            sp_map.get(&5) .map(|&(p,_)| p).unwrap_or(0.0),
+            sp_map.get(&10).map(|&(p,_)| p).unwrap_or(0.0),
+        ];
+        (s, sp)
+    };
 
     let sn_map     = sniper.predict(window, &live_ind, &[s_val, sp_v[0], sp_v[1], sp_v[2]], anchor);
 
     let mut sniper_pct = [0.0f64; 10];
     for m in 1..=10 {
-        sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p.clamp(-0.05, 0.05)).unwrap_or(0.0);
+        sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p).unwrap_or(0.0);
     }
 
     let familiarity  = knn.familiarity(&live_ind, knn_k);
     let cascade      = vec![s_val, sp_v[0], sp_v[1], sp_v[2]];
     let sniper_inp   = sniper.build_input(window, &live_ind, &cascade);
-    let mean_abs     = sniper_pct.iter().map(|p| p.abs()).sum::<f64>() / 10.0;
-    let eff_noise    = (mean_abs * 0.20).max(noise_std);
+    let eff_noise    = noise_std;
 
     let mut confidences = [0.0f64; 10];
     for m in 1..=10 {
@@ -939,14 +987,13 @@ fn run_day_verbose(
 
     let mut sniper_pct = [0.0f64; 10];
     for m in 1..=10 {
-        sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p.clamp(-0.05, 0.05)).unwrap_or(0.0);
+        sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p).unwrap_or(0.0);
     }
 
     let familiarity  = knn.familiarity(&live_ind, knn_k);
     let cascade      = vec![s_val, sp_v[0], sp_v[1], sp_v[2]];
     let sniper_inp   = sniper.build_input(&window, &live_ind, &cascade);
-    let mean_abs     = sniper_pct.iter().map(|p| p.abs()).sum::<f64>() / 10.0;
-    let eff_noise    = (mean_abs * 0.20).max(noise_std);
+    let eff_noise    = noise_std;
 
     let show_passes  = jitter_passes.min(10);
     let mut confidences      = [0.0f64; 10];
@@ -983,12 +1030,14 @@ fn run_day_verbose(
         let label_c   = confidence_label(conf);
         let dir       = clean_dir(sniper_pct[m-1]);
         let pred_str  = sn_map.get(&m)
-            .map(|(p,d)| format!("{:>+6.3}% / ${:<8.4}", p*100.0, d))
+            .map(|&(p,d)| format!("p={:.3} ({:>+.3})", d, p))
             .unwrap_or_else(|| "       --         ".into());
         let clean_bull = sniper_pct[m-1] >= 0.0;
         let pass_cols: String = jitter_data[m-1][..show_passes].iter().map(|&p| {
-            let agrees = (p >= 0.0) == clean_bull;
-            format!(" {} ", if agrees { clean_dir(p) } else { if p >= 0.0 { "△" } else { "▽" } })
+            // jitter passes are raw sigmoid outputs (0-1), threshold at 0.5
+            let agrees = (p >= 0.5) == clean_bull;
+            format!(" {} ", if agrees { if p >= 0.5 { "▲" } else { "▼" } }
+                            else      { if p >= 0.5 { "△" } else { "▽" } })
         }).collect::<Vec<_>>().join("|");
 
         if has_actual {
@@ -1090,6 +1139,7 @@ fn main() {
     let mut from_str:      String = String::new(); // --from YYYY-MM-DD
     let mut to_str:        String = String::new(); // --to   YYYY-MM-DD
     let mut daily_time:    String = "17:00".into(); // --daily-time HH:MM
+    let mut sniper_only_flag: bool = false;         // --sniper-only
 
     let mut i = 2;
     while i < args.len() {
@@ -1106,14 +1156,17 @@ fn main() {
             "--interval"      => { interval_mins  = args[i+1].parse().unwrap_or(1);  i += 2; }
             "--noise"         => { noise_std      = args[i+1].parse().unwrap_or(0.001); i += 2; }
             "--symbols"       => { symbols_str     = args[i+1].clone();              i += 2; }
+            "--sniper-only"   => { sniper_only_flag = true;                           i += 1; }
             _                 => { i += 1; }
         }
     }
 
     println!("Loading weights from '{}'...", weights_path);
-    let (cfg, scout, spotter, sniper) = load_weights(&weights_path);
-    println!("  lookback={} hidden={} layers={} prefix={}",
-        cfg.lookback, cfg.hidden, cfg.layers, cfg.out_prefix);
+    let (mut cfg, scout, spotter, sniper) = load_weights(&weights_path);
+    // CLI flag overrides whatever is baked into the weights file
+    if sniper_only_flag { cfg.sniper_only = true; }
+    println!("  lookback={} hidden={} layers={} prefix={} sniper_only={}",
+        cfg.lookback, cfg.hidden, cfg.layers, cfg.out_prefix, cfg.sniper_only);
 
     if symbol.is_empty() { symbol = cfg.out_prefix.clone(); }
 
@@ -1194,7 +1247,7 @@ fn main() {
                         if let Some(dr) = run_day_quiet(
                             &window, &scout, &spotter, &sniper,
                             &future, &knn,
-                            jitter_passes, knn_k, noise_std, cur,
+                            jitter_passes, knn_k, noise_std, cur, &cfg,
                         ) {
                             let acc_str = if dr.total > 0 {
                                 format!("{}/{}", dr.correct, dr.total)
@@ -1459,7 +1512,7 @@ fn main() {
 
             if window.len() >= 2 {
                 let (correct, total) = run_prediction(&window, &sym_scout, &sym_spotter, &sym_sniper,
-                    &future, &label, &sym_knn, jitter_passes, knn_k, noise_std);
+                    &future, &label, &sym_knn, jitter_passes, knn_k, noise_std, &sym_cfg);
                 total_correct += correct;
                 total_calls   += total;
             }
@@ -1614,5 +1667,5 @@ fn main() {
         KnnIndex { vecs: vec![], p90_dist: 1.0 }
     };
 
-    let _ = run_prediction(&window, &scout, &spotter, &sniper, &future, &mode_label, &knn, jitter_passes, knn_k, noise_std);
+    let _ = run_prediction(&window, &scout, &spotter, &sniper, &future, &mode_label, &knn, jitter_passes, knn_k, noise_std, &cfg);
 }

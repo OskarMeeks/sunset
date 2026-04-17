@@ -3,12 +3,24 @@ name = "stock_tracker"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "stock_tracker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cascade_trainer"
+path = "src/bin/cascade_trainer.rs"
+
+[[bin]]
+name = "scan_predict"
+path = "src/bin/scan_predict.rs"
+
 [dependencies]
 chrono     = { version = "0.4", features = ["serde"] }
 rand       = "0.8"
 reqwest    = { version = "0.11", features = ["blocking", "json"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-rayon  = "1.10"
-num_cpus = "1.16"
+rayon      = "1.10"
+num_cpus   = "1.16"
 rust_xlsxwriter = "0.64"

@@ -303,7 +303,7 @@ impl<'de> serde::Deserialize<'de> for RunRecord {
 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct Config {
+pub struct Config {
     lookback: usize,
     hidden: usize,
     layers: usize,
@@ -341,171 +341,19 @@ impl Default for Config {
 }
 
 // ─────────────────────────────────────────────
+//  Technical indicators — delegated to indicators.rs
+// ─────────────────────────────────────────────
+
+use stock_tracker::indicators;
+use stock_tracker::indicators::{INDICATOR_NF, compute_indicators};
+
+
+
+// ─────────────────────────────────────────────
 //  Neural Structures (Optimized)
 // ─────────────────────────────────────────────
 
 
-
-// ─────────────────────────────────────────────
-//  Technical indicators — 18 pre-computed market signals
-// ─────────────────────────────────────────────
-//
-//  These are appended ONCE per sample at the end of the flat input vector
-//  (after the bar-by-bar rolling features), so the network receives both
-//  raw price action AND pre-derived signals it would otherwise have to
-//  discover from scratch:
-//
-//   Trend      [0-3]  EMA(9) dist, EMA(21) dist, EMA slope, EMA crossover
-//   Momentum   [4-6]  RSI(14), MACD histogram, MACD signal direction
-//   Volatility [7-9]  Bollinger %B, bandwidth, ATR ratio
-//   Structure  [10-12] Pivot support dist, resistance dist, SR cluster
-//   VWAP       [13-14] VWAP distance, VWAP slope
-//   Volume     [15-16] OBV momentum, volume ratio vs 20-bar avg
-//   Candle     [17]   Body ratio (bullish/bearish bar strength)
-
-const INDICATOR_NF: usize = 18;
-
-fn ema_calc(closes: &[f64], period: usize) -> f64 {
-    if closes.is_empty() { return 0.0; }
-    let k = 2.0 / (period as f64 + 1.0);
-    closes.iter().skip(1).fold(closes[0], |e, &c| c * k + e * (1.0 - k))
-}
-
-fn rsi_calc(closes: &[f64], period: usize) -> f64 {
-    if closes.len() < period + 1 { return 0.5; }
-    let recent = &closes[closes.len() - period - 1..];
-    let (mut ag, mut al) = (0.0_f64, 0.0_f64);
-    for w in recent.windows(2) {
-        let d = w[1] - w[0];
-        if d > 0.0 { ag += d; } else { al += d.abs(); }
-    }
-    ag /= period as f64; al /= period as f64;
-    if al < 1e-10 { return 1.0; }
-    let rs = ag / al;
-    (rs / (1.0 + rs)).clamp(0.0, 1.0)
-}
-
-fn macd_calc(closes: &[f64]) -> (f64, f64) {
-    if closes.len() < 26 { return (0.0, 0.0); }
-    let fast = ema_calc(closes, 12);
-    let slow = ema_calc(closes, 26);
-    let line = fast - slow;
-    let n    = closes.len();
-    let series: Vec<f64> = (9..=n).map(|e| ema_calc(&closes[..e], 12) - ema_calc(&closes[..e], 26)).collect();
-    let signal = ema_calc(&series, 9);
-    let hist   = (line - signal) / closes.last().unwrap_or(&1.0).abs().max(1e-8);
-    (hist.clamp(-0.01, 0.01) / 0.01, signal.signum())
-}
-
-fn bollinger_calc(closes: &[f64], period: usize) -> (f64, f64) {
-    if closes.len() < period { return (0.0, 0.0); }
-    let w    = &closes[closes.len() - period..];
-    let mean = w.iter().sum::<f64>() / period as f64;
-    let std  = (w.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / period as f64).sqrt().max(1e-8);
-    let c    = *closes.last().unwrap();
-    let pct_b = ((c - (mean - 2.0 * std)) / (4.0 * std).max(1e-8)).clamp(0.0, 1.0) * 2.0 - 1.0;
-    let bw    = (4.0 * std / mean.abs().max(1e-8)).clamp(0.0, 0.1) / 0.1;
-    (pct_b, bw)
-}
-
-fn atr_ratio_calc(data: &[StockData], period: usize) -> f64 {
-    if data.len() < period + 1 { return 0.0; }
-    let trs: Vec<f64> = data.windows(2).map(|w| {
-        let tr = (w[1].high - w[1].low)
-            .max((w[1].high - w[0].close).abs())
-            .max((w[1].low  - w[0].close).abs());
-        tr / w[1].close.max(1e-8)
-    }).collect();
-    let avg  = trs[trs.len().saturating_sub(period)..].iter().sum::<f64>() / period.min(trs.len()) as f64;
-    let last = *trs.last().unwrap_or(&0.0);
-    ((last / avg.max(1e-8)).clamp(0.0, 5.0) / 5.0) * 2.0 - 1.0
-}
-
-fn pivot_sr_calc(data: &[StockData]) -> (f64, f64, f64) {
-    if data.len() < 5 { return (0.0, 0.0, 0.0); }
-    let close = data.last().unwrap().close;
-    let (mut sup, mut res): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
-    for i in 2..data.len() - 2 {
-        let (h, l) = (data[i].high, data[i].low);
-        if h > data[i-1].high && h > data[i-2].high && h > data[i+1].high && h > data[i+2].high { res.push(h); }
-        if l < data[i-1].low  && l < data[i-2].low  && l < data[i+1].low  && l < data[i+2].low  { sup.push(l); }
-    }
-    let sd = sup.iter().filter(|&&s| s < close).map(|&s| (close - s) / close).fold(f64::MAX, f64::min);
-    let rd = res.iter().filter(|&&r| r > close).map(|&r| (r - close) / close).fold(f64::MAX, f64::min);
-    let sn = if sd == f64::MAX { -1.0 } else { (1.0 - sd.clamp(0.0, 0.05) / 0.05) * 2.0 - 1.0 };
-    let rn = if rd == f64::MAX {  1.0 } else { (1.0 - rd.clamp(0.0, 0.05) / 0.05) * 2.0 - 1.0 };
-    let all: Vec<f64> = sup.iter().chain(res.iter()).copied().collect();
-    let cl = if all.is_empty() { 0.0 } else {
-        let near = all.iter().filter(|&&p| ((p - close) / close).abs() < 0.005).count();
-        (near as f64 / all.len() as f64).clamp(0.0, 1.0)
-    };
-    (sn, rn, cl)
-}
-
-fn vwap_calc(data: &[StockData]) -> (f64, f64) {
-    if data.is_empty() { return (0.0, 0.0); }
-    let (mut cpv, mut cv) = (0.0, 0.0);
-    let vwaps: Vec<f64> = data.iter().map(|b| {
-        cpv += (b.high + b.low + b.close) / 3.0 * (b.volume as f64).max(1.0);
-        cv  += (b.volume as f64).max(1.0);
-        cpv / cv
-    }).collect();
-    let vw = *vwaps.last().unwrap();
-    let c  = data.last().unwrap().close;
-    let dist  = ((c - vw) / c.max(1e-8)).clamp(-0.05, 0.05) / 0.05;
-    let n     = vwaps.len();
-    let slope = if n >= 5 { ((vwaps[n-1] - vwaps[n-5]) / vwaps[n-5].abs().max(1e-8)).clamp(-0.02, 0.02) / 0.02 } else { 0.0 };
-    (dist, slope)
-}
-
-fn obv_calc(data: &[StockData]) -> f64 {
-    if data.len() < 2 { return 0.0; }
-    let (mut v, mut scale) = (0.0_f64, 0.0_f64);
-    let mut obvs = vec![0.0_f64; data.len()];
-    for i in 1..data.len() {
-        let d = data[i].close - data[i-1].close;
-        v += if d > 0.0 { data[i].volume as f64 } else if d < 0.0 { -(data[i].volume as f64) } else { 0.0 };
-        obvs[i] = v;
-        scale = scale.max(v.abs());
-    }
-    let n  = obvs.len();
-    let lb = 10.min(n - 1);
-    ((obvs[n-1] - obvs[n-1-lb]) / scale.max(1.0)).clamp(-1.0, 1.0)
-}
-
-fn volume_ratio_calc(data: &[StockData]) -> f64 {
-    if data.is_empty() { return 0.0; }
-    let w   = &data[data.len().saturating_sub(20)..];
-    let avg = w.iter().map(|b| b.volume as f64).sum::<f64>() / w.len().max(1) as f64;
-    (data.last().unwrap().volume as f64 / avg.max(1.0)).clamp(0.0, 5.0) / 5.0 * 2.0 - 1.0
-}
-
-/// Build the full 18-feature indicator vector for a lookback window.
-fn compute_indicators(data: &[StockData]) -> [f64; INDICATOR_NF] {
-    let closes: Vec<f64> = data.iter().map(|b| b.close).collect();
-    let c  = *closes.last().unwrap_or(&1.0);
-    let e9 = ema_calc(&closes, 9);
-    let e21= ema_calc(&closes, 21);
-    let e9_d  = ((c - e9)  / c.max(1e-8)).clamp(-0.05, 0.05) / 0.05;
-    let e21_d = ((c - e21) / c.max(1e-8)).clamp(-0.05, 0.05) / 0.05;
-    let e9_sl = if closes.len() >= 2 {
-        let now  = ema_calc(&closes, 9);
-        let prev = ema_calc(&closes[..closes.len()-1], 9);
-        ((now - prev) / prev.abs().max(1e-8)).clamp(-0.02, 0.02) / 0.02
-    } else { 0.0 };
-    let cross   = if e9 > e21 { 1.0 } else { -1.0 };
-    let rsi14   = rsi_calc(&closes, 14) * 2.0 - 1.0;
-    let (mh, ms)= macd_calc(&closes);
-    let (pb, bw)= bollinger_calc(&closes, 20);
-    let atr_r   = atr_ratio_calc(data, 14);
-    let (sup,res,sr) = pivot_sr_calc(data);
-    let (vd, vs)= vwap_calc(data);
-    let obv     = obv_calc(data);
-    let vol     = volume_ratio_calc(data);
-    let bar     = data.last().unwrap();
-    let body    = ((bar.close - bar.open) / (bar.high - bar.low).max(1e-8)).clamp(-1.0, 1.0);
-    [e9_d, e21_d, e9_sl, cross, rsi14, mh, ms, pb, bw, atr_r, sup, res, sr, vd, vs, obv, vol, body]
-}
 
 const NF: usize = 7;
 
@@ -647,8 +495,8 @@ struct Net {
 
 impl Net {
     fn new(target_offsets: Vec<usize>, n_extra: usize, cfg: &Config) -> Self {
-        // input = (lookback-1) bar features + INDICATOR_NF technical signals + cascade extras
-        let input_size = (cfg.lookback - 1) * NF + INDICATOR_NF + n_extra;
+        // input = lookback bars × (NF raw + INDICATOR_NF indicators) + cascade extras
+        let input_size = cfg.lookback * (NF + INDICATOR_NF) + n_extra;
         let mut rng = 0xdeadbeef_cafebabe_u64;
         let mut layers = Vec::new();
         let mut prev = input_size;
@@ -674,8 +522,14 @@ impl Net {
         for i in 0..n_samples {
             let anchor     = data[i + self.lookback - 1].close.max(1e-8);
             let mut inp = Vec::with_capacity(input_dim);
-            for j in i + 1..i + self.lookback { inp.extend_from_slice(&extract(&data[j], &data[j - 1])); }
-            inp.extend_from_slice(&indicators[i + self.lookback - 1]);
+            // Candle 0: no previous bar, use self as prev for extract
+            inp.extend_from_slice(&extract(&data[i], &data[i]));
+            inp.extend_from_slice(&indicators[i]);
+            // Candles 1..lookback-1: interleave raw bar features + per-candle indicators
+            for j in i + 1..i + self.lookback {
+                inp.extend_from_slice(&extract(&data[j], &data[j - 1]));
+                inp.extend_from_slice(&indicators[j]);
+            }
             inp.extend(cascade_fn(i));
             flat_inputs[i*input_dim..(i+1)*input_dim].copy_from_slice(&inp);
             for (ti, &off) in self.target_offsets.iter().enumerate() {
@@ -938,10 +792,18 @@ impl Net {
         history
     }
 
-    fn predict(&self, data: &[StockData], ind: &[f64; INDICATOR_NF], cascade: &[f64], anchor: f64) -> HashMap<usize, (f64, f64)> {
+    fn predict(&self, data: &[StockData], _ind: &[f64; INDICATOR_NF], cascade: &[f64], _anchor: f64) -> HashMap<usize, (f64, f64)> {
         let mut inp = Vec::with_capacity(self.layers[0].in_size);
-        for i in 1..self.lookback { inp.extend_from_slice(&extract(&data[i], &data[i - 1])); }
-        inp.extend_from_slice(ind);
+        // Candle 0: no previous bar
+        let ind0 = compute_indicators(&indicators::bars_from_cascade(&data[..1]));
+        inp.extend_from_slice(&extract(&data[0], &data[0]));
+        inp.extend_from_slice(&ind0);
+        // Remaining candles: per-candle raw + indicators over growing window
+        for i in 1..self.lookback.min(data.len()) {
+            let ind_i = compute_indicators(&indicators::bars_from_cascade(&data[..=i]));
+            inp.extend_from_slice(&extract(&data[i], &data[i - 1]));
+            inp.extend_from_slice(&ind_i);
+        }
         inp.extend_from_slice(cascade);
         let mut ws = Workspace::new(&self.layers, self.layers[0].in_size);
         ws.acts[0].copy_from_slice(&inp);
@@ -1047,8 +909,8 @@ fn save_all_weights(path: &str, cfg: &Config, scout: &Net, spotter: &Net, sniper
 //  Data fetching — delegated to generator module
 // ─────────────────────────────────────────────
 
-mod generator;
-use generator::{maybe_download, parse_csv, StockData};
+
+use stock_tracker::generator::{maybe_download, parse_csv, StockData};
 
 fn main() -> io::Result<()> {
     // Limit CPU to 75%
@@ -1208,7 +1070,7 @@ fn main() -> io::Result<()> {
             println!("  Precomputing technical indicators...");
             let t_ind = Instant::now();
             let indicators: Vec<[f64; INDICATOR_NF]> = (0..data.len())
-                .map(|i| { let start = i.saturating_sub(sym_cfg.lookback - 1); compute_indicators(&data[start..=i]) })
+                .map(|i| { let start = i.saturating_sub(sym_cfg.lookback - 1); compute_indicators(&indicators::bars_from_cascade(&data[start..=i])) })
                 .collect();
             println!("  Done in {:.2?} ({} snapshots)", t_ind.elapsed(), indicators.len());
 
@@ -1329,7 +1191,7 @@ fn main() -> io::Result<()> {
     let indicators: Vec<[f64; INDICATOR_NF]> = (0..data.len())
         .map(|i| {
             let start = i.saturating_sub(cfg.lookback - 1);
-            compute_indicators(&data[start..=i])
+            compute_indicators(&indicators::bars_from_cascade(&data[start..=i]))
         })
         .collect();
     println!("  Done in {:.2?} ({} snapshots)\n", t_ind.elapsed(), indicators.len());
@@ -1341,7 +1203,7 @@ fn main() -> io::Result<()> {
     let live_ind = &indicators[r_end - 1];
 
     // ── sniper-only mode: skip Scout & Spotter, train Sniper with zeroed cascade inputs ──
-    let (mut scout, mut spotter, scout_history, spotter_history, s_val, sp_v, sp_live) =
+    let (scout, spotter, scout_history, spotter_history, s_val, sp_v, sp_live) =
         if sniper_only {
             println!("  [sniper-only] skipping Scout and Spotter — cascade inputs will be zero");
             let dummy_scout   = Net::new(vec![9],        0, &cfg);

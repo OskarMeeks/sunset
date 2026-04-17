@@ -103,8 +103,7 @@ impl Default for Config {
 //  Data fetching — delegated to generator module
 // ─────────────────────────────────────────────
 
-mod generator;
-use generator::{ensure_data_for_date, fetch_or_load, parse_csv, StockData};
+use stock_tracker::generator::{ensure_data_for_date, fetch_or_load, parse_csv, StockData};
 
 // ─────────────────────────────────────────────
 //  Technical indicators  (18 features)
@@ -482,7 +481,7 @@ struct Net {
 
 impl Net {
     fn blank(target_offsets: Vec<usize>, n_extra: usize, cfg: &Config) -> Self {
-        let input_size = (cfg.lookback-1)*NF + INDICATOR_NF + n_extra;
+        let input_size = cfg.lookback * (NF + INDICATOR_NF) + n_extra;
         let mut layers = Vec::new();
         let mut prev = input_size;
         for _ in 0..cfg.layers { layers.push(Layer::blank(prev, cfg.hidden, false)); prev = cfg.hidden; }
@@ -505,10 +504,19 @@ impl Net {
         }
     }
 
-    fn predict(&self, data: &[StockData], ind: &[f64; INDICATOR_NF], cascade: &[f64], anchor: f64) -> HashMap<usize,(f64,f64)> {
+    fn predict(&self, data: &[StockData], _ind: &[f64; INDICATOR_NF], cascade: &[f64], anchor: f64) -> HashMap<usize,(f64,f64)> {
+        let _ = anchor;
         let mut inp = Vec::with_capacity(self.layers[0].in_size);
-        for i in 1..self.lookback { inp.extend_from_slice(&extract(&data[i], &data[i-1])); }
-        inp.extend_from_slice(ind);
+        // Candle 0: self-diff, indicators over window of 1
+        let ind0 = compute_indicators(&data[..1]);
+        inp.extend_from_slice(&extract(&data[0], &data[0]));
+        inp.extend_from_slice(&ind0);
+        // Remaining candles: per-candle raw + indicators over growing window
+        for i in 1..self.lookback.min(data.len()) {
+            let ind_i = compute_indicators(&data[..=i]);
+            inp.extend_from_slice(&extract(&data[i], &data[i - 1]));
+            inp.extend_from_slice(&ind_i);
+        }
         inp.extend_from_slice(cascade);
         let mut acts: Vec<Vec<f64>> = vec![inp];
         for layer in &self.layers {
@@ -528,10 +536,18 @@ impl Net {
 
 impl Net {
     /// Build the input vector for this window (same as predict, without running the net).
-    fn build_input(&self, data: &[StockData], ind: &[f64; INDICATOR_NF], cascade: &[f64]) -> Vec<f64> {
+    fn build_input(&self, data: &[StockData], _ind: &[f64; INDICATOR_NF], cascade: &[f64]) -> Vec<f64> {
         let mut inp = Vec::with_capacity(self.layers[0].in_size);
-        for i in 1..self.lookback { inp.extend_from_slice(&extract(&data[i], &data[i-1])); }
-        inp.extend_from_slice(ind);
+        // Candle 0: self-diff, indicators over window of 1
+        let ind0 = compute_indicators(&data[..1]);
+        inp.extend_from_slice(&extract(&data[0], &data[0]));
+        inp.extend_from_slice(&ind0);
+        // Remaining candles: per-candle raw + indicators over growing window
+        for i in 1..self.lookback.min(data.len()) {
+            let ind_i = compute_indicators(&data[..=i]);
+            inp.extend_from_slice(&extract(&data[i], &data[i - 1]));
+            inp.extend_from_slice(&ind_i);
+        }
         inp.extend_from_slice(cascade);
         inp
     }
@@ -951,14 +967,13 @@ fn run_day_verbose(
         .unwrap_or_else(|| date.and_hms_opt(17, 0, 0).unwrap());
     let anchor_utc: DateTime<Utc> = Utc.from_utc_datetime(&anchor_ndt);
 
-    let anchor_idx = match all_bars.iter().rposition(|b| b.ts <= anchor_utc) {
-        Some(i) => i,
-        None    => { println!("  No bar found for {} at {:02}:{:02} UTC", date, anchor_time_h, anchor_time_m); return; }
+    let anchor_idx: usize = match all_bars.iter().rposition(|b| b.ts <= anchor_utc) {
+        None => {
+            println!("  No trading data for {} — skipping verbose output.", date);
+            return;
+        }
+        Some(idx) => idx,
     };
-    if all_bars[anchor_idx].ts.date_naive() != date {
-        println!("  No trading data for {} — skipping verbose output.", date);
-        return;
-    }
 
     let win_start = anchor_idx.saturating_sub(cfg.lookback - 1);
     let window: Vec<StockData> = all_bars[win_start..=anchor_idx].to_vec();
@@ -1493,7 +1508,7 @@ fn main() {
             let all = { let r = parse_csv(&src); if interval_mins > 1 { resample(r, interval_mins) } else { r } };
             if all.is_empty() { eprintln!("  Skipping {} — no bars.", sym_upper); continue; }
 
-            let anchor_idx = match all.iter().rposition(|b| b.ts <= at_utc) {
+            let anchor_idx: usize = match all.iter().rposition(|b| b.ts <= at_utc) {
                 Some(i) => i,
                 None    => { eprintln!("  Skipping {} — no bar at or before {}", sym_upper, at_str); continue; }
             };
@@ -1636,7 +1651,7 @@ fn main() {
             let start  = bars.len().saturating_sub(cfg.lookback);
             let window = bars[start..].to_vec();
             let is_live = bars.last()
-                .map(|b| (Utc::now() - b.ts).num_seconds() <= 120)
+                .map(|b| Utc::now().signed_duration_since(b.ts).num_seconds() <= 120)
                 .unwrap_or(false);
             let label  = format!("{} (anchor {})",
                 if is_live { "LIVE" } else { "CACHED" },

@@ -173,7 +173,7 @@ fn run_day_verbose(
     jitter_passes: usize,
     knn_k:         usize,
     noise_std:     f64,
-    _interval_mins: usize,
+    interval_mins: usize,
     label:         &str,
 ) {
     let anchor_ndt = date.and_hms_opt(anchor_time_h, anchor_time_m, 0)
@@ -228,16 +228,18 @@ fn run_day_verbose(
     println!();
 
     let pass_header: String = (0..show_passes).map(|i| format!(" J{:<2}", i+1)).collect();
-    println!("  Min | Sniper prediction    | Conf           | Dir | Actual               |{}", pass_header);
-    println!("  ----|---------------------|----------------|-----|----------------------|{}", "-".repeat(show_passes * 4));
+    println!("  Min | AI pred%   | Conf           | Dir | Actual (candle%)     |{}", pass_header);
+    println!("  ----|-----------|----------------|-----|----------------------|{}", "-".repeat(show_passes * 4));
 
     let mut total_correct = 0usize;
     for m in 1..=10 {
+        let actual_min = m * interval_mins;
         let conf      = confidences[m-1];
         let label_c   = confidence_label(conf);
         let dir       = clean_dir(sniper_pct[m-1]);
-        let pred_str  = sn_map.get(&m).map(|&(p,d)| format!("p={:.3} ({:>+.3})", d, p))
-            .unwrap_or_else(|| "       --         ".into());
+        // sniper_pct[m-1] is the deviation from 0.5 — treat it as the predicted % move signal
+        let pred_pct  = sniper_pct[m-1] * 100.0;
+        let pred_str  = format!("{:>+6.3}%", pred_pct);
         let clean_bull = sniper_pct[m-1] >= 0.0;
         let pass_cols: String = jitter_data[m-1][..show_passes].iter().map(|&p| {
             let agrees = (p >= 0.5) == clean_bull;
@@ -247,17 +249,19 @@ fn run_day_verbose(
 
         if has_actual {
             let actual_str = if m <= future.len() {
-                let pct     = (future[m-1].close - anchor) / anchor;
+                // per-candle % change from previous bar
+                let prev_close = if m == 1 { anchor } else { future[m-2].close };
+                let pct     = (future[m-1].close - prev_close) / prev_close;
                 let correct = (sniper_pct[m-1] >= 0.0) == (pct >= 0.0);
                 if correct { total_correct += 1; }
                 format!("{:>+6.3}% / ${:<8.4} {}", pct*100.0, future[m-1].close,
                     if correct { "✓" } else { "✗" })
             } else { "  (no data)        ".into() };
-            println!("  {:>2}  | {:<19} | {} {:.0}% | {} | {:<20} |{}",
-                m, pred_str, label_c, conf*100.0, dir, actual_str, pass_cols);
+            println!("  {:>3} | {:<9} | {} {:.0}% | {} | {:<20} |{}",
+                actual_min, pred_str, label_c, conf*100.0, dir, actual_str, pass_cols);
         } else {
-            println!("  {:>2}  | {:<19} | {} {:.0}% | {} |{}",
-                m, pred_str, label_c, conf*100.0, dir, pass_cols);
+            println!("  {:>3} | {:<9} | {} {:.0}% | {} |{}",
+                actual_min, pred_str, label_c, conf*100.0, dir, pass_cols);
         }
     }
 
@@ -291,6 +295,7 @@ fn run_prediction(
     jitter_passes: usize,
     knn_k:         usize,
     noise_std:     f64,
+    interval_mins: usize,
     _cfg:          &Config,
 ) -> (usize, usize) {
     if window.is_empty() { eprintln!("Window is empty — cannot predict."); return (0, 0); }
@@ -366,20 +371,25 @@ fn run_prediction(
     let pass_header: String = (0..show_passes).map(|i| format!(" J{:<2}", i+1)).collect();
 
     if has_actual {
-        println!("  Min | Sniper prediction   | Confidence             | Dir | Actual               |{}", pass_header);
-        println!("  ----|---------------------|------------------------|-----|----------------------|{}",
+        println!("  Min | AI pred%   | Confidence             | Dir | Actual (candle%)     |{}", pass_header);
+        println!("  ----|-----------|------------------------|-----|----------------------|{}",
             "-".repeat(show_passes * 4));
     } else {
-        println!("  Min | Sniper prediction   | Confidence             | Dir |{}", pass_header);
-        println!("  ----|---------------------|------------------------|-----|{}",
+        println!("  Min | AI pred%   | Confidence             | Dir |{}", pass_header);
+        println!("  ----|-----------|------------------------|-----|{}",
             "-".repeat(show_passes * 4));
     }
 
     for m in 1..=10 {
+        let actual_min = m * interval_mins;
         let conf  = confidences[m-1];
         let label = confidence_label(conf);
         let bar   = confidence_bar(conf);
         let dir   = clean_dir(sniper_pct[m-1]);
+
+        // sniper_pct[m-1] is deviation from 0.5 — use as predicted % move signal
+        let pred_pct = sniper_pct[m-1] * 100.0;
+        let pred_str = format!("{:>+6.3}%", pred_pct);
 
         let clean_bull = sniper_pct[m-1] >= 0.0;
         let pass_cols: String = jitter_passes_data[m-1][..show_passes].iter().map(|&p| {
@@ -390,22 +400,25 @@ fn run_prediction(
 
         if has_actual {
             let actual = if m <= future.len() {
-                let pct     = (future[m-1].close - anchor) / anchor;
+                // per-candle % change from previous bar
+                let prev_close = if m == 1 { anchor } else { future[m-2].close };
+                let pct     = (future[m-1].close - prev_close) / prev_close;
                 let correct = (sniper_pct[m-1] >= 0.0) == (pct >= 0.0);
                 format!("{:>+6.3}% / ${:<8.4} {}", pct*100.0, future[m-1].close,
                     if correct { "✓" } else { "✗" })
             } else { "  (no data)        ".into() };
-            println!("  {:>2}  | {:<19} | {} {} {:.0}% | {} | {:<20} |{}",
-                m, fmt_pred(&sn_map, m), bar, label, conf*100.0, dir, actual, pass_cols);
+            println!("  {:>3} | {:<9} | {} {} {:.0}% | {} | {:<20} |{}",
+                actual_min, pred_str, bar, label, conf*100.0, dir, actual, pass_cols);
         } else {
-            println!("  {:>2}  | {:<19} | {} {} {:.0}% | {} |{}",
-                m, fmt_pred(&sn_map, m), bar, label, conf*100.0, dir, pass_cols);
+            println!("  {:>3} | {:<9} | {} {} {:.0}% | {} |{}",
+                actual_min, pred_str, bar, label, conf*100.0, dir, pass_cols);
         }
     }
 
     if has_actual && future.len() >= 10 {
         let correct: usize = (1..=10).filter(|&m| {
-            let pct = (future[m-1].close - anchor) / anchor;
+            let prev_close = if m == 1 { anchor } else { future[m-2].close };
+            let pct = (future[m-1].close - prev_close) / prev_close;
             (sniper_pct[m-1] >= 0.0) == (pct >= 0.0)
         }).count();
         println!();
@@ -413,7 +426,8 @@ fn run_prediction(
 
         let hc_correct = (1..=10).filter(|&m| {
             confidences[m-1] >= 0.40 && {
-                let pct = (future[m-1].close - anchor) / anchor;
+                let prev_close = if m == 1 { anchor } else { future[m-2].close };
+                let pct = (future[m-1].close - prev_close) / prev_close;
                 (sniper_pct[m-1] >= 0.0) == (pct >= 0.0)
             }
         }).count();
@@ -452,7 +466,8 @@ fn run_prediction(
 
     let correct = if has_actual && future.len() >= 10 {
         (1..=10).filter(|&m| {
-            let pct = (future[m-1].close - anchor) / anchor;
+            let prev_close = if m == 1 { anchor } else { future[m-2].close };
+            let pct = (future[m-1].close - prev_close) / prev_close;
             (sniper_pct[m-1] >= 0.0) == (pct >= 0.0)
         }).count()
     } else { 0 };
@@ -553,6 +568,10 @@ fn main() {
 
         let src = if !csv_path.is_empty() { csv_path.clone() }
                   else { format!("{}_data.csv", symbol.to_uppercase()) };
+
+        // Auto-download data if needed — mirrors --at and --symbols behaviour.
+        ensure_data_for_date(&symbol, &src, to_date, &api_key);
+
         if !std::path::Path::new(&src).exists() {
             eprintln!("No data file '{}' — cannot run date-range backtest.", src);
             return;
@@ -561,12 +580,28 @@ fn main() {
         let all_bars = { let r = parse_csv(&src); if interval_mins > 1 { resample(r, interval_mins) } else { r } };
         if all_bars.is_empty() { eprintln!("No bars in '{}'.", src); return; }
 
-        let knn = { let idx = KnnIndex::build(&all_bars, cfg.lookback); println!("  {} training vectors indexed for familiarity.\n", idx.vecs.len()); idx };
+        // Build KNN index only from bars strictly before the backtest window so
+        // familiarity reflects the training distribution, not future data.
+        let from_utc: DateTime<Utc> = Utc.from_utc_datetime(
+            &from_date.and_hms_opt(0, 0, 0).unwrap()
+        );
+        let training_bars: Vec<_> = all_bars.iter()
+            .filter(|b| b.ts < from_utc)
+            .cloned()
+            .collect();
+        println!("  {} bars before {} used for familiarity index ({} total in CSV).",
+            training_bars.len(), from_date, all_bars.len());
+        let knn = {
+            let idx = KnnIndex::build(&training_bars, cfg.lookback);
+            println!("  {} training vectors indexed for familiarity.\n", idx.vecs.len());
+            idx
+        };
 
         println!("━━━ Date-range backtest: {} → {}  (daily anchor {:02}:{:02} UTC) ━━━",
             from_date, to_date, hh, mm);
+        let act_label = format!("Act{}m%", 10 * interval_mins);
         println!("  {:<12} | {:>9} | {:>6} | {:>8} | {:>8} | {:>8} | {:<9}",
-            "Date", "Close", "Acc", "AvgConf", "Pred%", "Act10m%", "Consensus");
+            "Date", "Close", "Acc", "AvgConf", "Pred%", act_label, "Consensus");
         println!("  {}", "-".repeat(75));
 
         let mut results: Vec<DayResult> = Vec::new();
@@ -786,7 +821,7 @@ fn main() {
 
             if window.len() >= 2 {
                 let (correct, total) = run_prediction(&window, &sym_sniper,
-                    &future, &label, &sym_knn, jitter_passes, knn_k, noise_std, &sym_cfg);
+                    &future, &label, &sym_knn, jitter_passes, knn_k, noise_std, interval_mins, &sym_cfg);
                 total_correct += correct;
                 total_calls   += total;
             }
@@ -902,5 +937,5 @@ fn main() {
         KnnIndex { vecs: vec![], p90_dist: 1.0 }
     };
 
-    let _ = run_prediction(&window, &sniper, &future, &mode_label, &knn, jitter_passes, knn_k, noise_std, &cfg);
+    let _ = run_prediction(&window, &sniper, &future, &mode_label, &knn, jitter_passes, knn_k, noise_std, interval_mins, &cfg);
 }

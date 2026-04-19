@@ -110,6 +110,7 @@ struct DayResult {
     avg_conf:      f64,
     consensus_dir: bool,
     avg_pct:       f64,
+    avg_mag:       f64,   // mean predicted magnitude across 10 offsets
     actual_pct_10: Option<f64>,
 }
 
@@ -132,7 +133,13 @@ fn run_day_quiet(
     let sn_map = sniper.predict(window, &live_ind, &[], anchor);
 
     let mut sniper_pct = [0.0f64; 10];
-    for m in 1..=10 { sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p).unwrap_or(0.0); }
+    let mut sniper_mag = [0.0f64; 10];
+    for m in 1..=10 {
+        if let Some(&(p, _, mag)) = sn_map.get(&m) {
+            sniper_pct[m-1] = p;
+            sniper_mag[m-1] = mag;
+        }
+    }
 
     let familiarity = knn.familiarity(&live_ind, knn_k);
     let sniper_inp  = sniper.build_input(window, &live_ind, &[]);
@@ -153,12 +160,13 @@ fn run_day_quiet(
     let total      = if has_actual { future.len().min(10) } else { 0 };
     let avg_conf   = confidences.iter().sum::<f64>() / 10.0;
     let avg_pct    = sniper_pct.iter().sum::<f64>() / 10.0;
+    let avg_mag    = sniper_mag.iter().sum::<f64>() / 10.0;
     let actual_10  = if future.len() >= 10 { Some((future[9].close - anchor) / anchor) } else { None };
 
     Some(DayResult {
         date, anchor_price: anchor,
         correct, total, avg_conf, consensus_dir: avg_pct >= 0.0,
-        avg_pct, actual_pct_10: actual_10,
+        avg_pct, avg_mag, actual_pct_10: actual_10,
     })
 }
 
@@ -199,7 +207,13 @@ fn run_day_verbose(
     let sn_map = sniper.predict(&window, &live_ind, &[], anchor);
 
     let mut sniper_pct = [0.0f64; 10];
-    for m in 1..=10 { sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p).unwrap_or(0.0); }
+    let mut sniper_mag = [0.0f64; 10];
+    for m in 1..=10 {
+        if let Some(&(p, _, mag)) = sn_map.get(&m) {
+            sniper_pct[m-1] = p;
+            sniper_mag[m-1] = mag;
+        }
+    }
 
     let familiarity = knn.familiarity(&live_ind, knn_k);
     let sniper_inp  = sniper.build_input(&window, &live_ind, &[]);
@@ -228,18 +242,17 @@ fn run_day_verbose(
     println!();
 
     let pass_header: String = (0..show_passes).map(|i| format!(" J{:<2}", i+1)).collect();
-    println!("  Min | AI pred%   | Conf           | Dir | Actual (candle%)     |{}", pass_header);
-    println!("  ----|-----------|----------------|-----|----------------------|{}", "-".repeat(show_passes * 4));
+    println!("  Min | Dir   Prob  Mag%   | Conf           | Actual (candle%)     |{}", pass_header);
+    println!("  ----|---------------------|----------------|----------------------|{}", "-".repeat(show_passes * 4));
 
     let mut total_correct = 0usize;
     for m in 1..=10 {
         let actual_min = m * interval_mins;
         let conf      = confidences[m-1];
         let label_c   = confidence_label(conf);
-        let dir       = clean_dir(sniper_pct[m-1]);
-        // sniper_pct[m-1] is the deviation from 0.5 — treat it as the predicted % move signal
-        let pred_pct  = sniper_pct[m-1] * 100.0;
-        let pred_str  = format!("{:>+6.3}%", pred_pct);
+        let dir        = clean_dir(sniper_pct[m-1]);
+        let raw_prob   = sn_map.get(&m).map(|&(_,d,_)| d).unwrap_or(0.5);
+        let pred_str   = format!("{} {:.3}  {:>+.4}", dir, raw_prob, sniper_mag[m-1]);
         let clean_bull = sniper_pct[m-1] >= 0.0;
         let pass_cols: String = jitter_data[m-1][..show_passes].iter().map(|&p| {
             let agrees = (p >= 0.5) == clean_bull;
@@ -257,11 +270,11 @@ fn run_day_verbose(
                 format!("{:>+6.3}% / ${:<8.4} {}", pct*100.0, future[m-1].close,
                     if correct { "✓" } else { "✗" })
             } else { "  (no data)        ".into() };
-            println!("  {:>3} | {:<9} | {} {:.0}% | {} | {:<20} |{}",
-                actual_min, pred_str, label_c, conf*100.0, dir, actual_str, pass_cols);
+            println!("  {:>3} | {:<21} | {} {:.0}% | {:<20} |{}",
+                actual_min, pred_str, label_c, conf*100.0, actual_str, pass_cols);
         } else {
-            println!("  {:>3} | {:<9} | {} {:.0}% | {} |{}",
-                actual_min, pred_str, label_c, conf*100.0, dir, pass_cols);
+            println!("  {:>3} | {:<21} | {} {:.0}% |{}",
+                actual_min, pred_str, label_c, conf*100.0, pass_cols);
         }
     }
 
@@ -342,7 +355,13 @@ fn run_prediction(
     let sn_map = sniper.predict(window, &live_ind, &[], anchor);
 
     let mut sniper_pct = [0.0f64; 10];
-    for m in 1..=10 { sniper_pct[m-1] = sn_map.get(&m).map(|&(p,_)| p).unwrap_or(0.0); }
+    let mut sniper_mag = [0.0f64; 10];
+    for m in 1..=10 {
+        if let Some(&(p, _, mag)) = sn_map.get(&m) {
+            sniper_pct[m-1] = p;
+            sniper_mag[m-1] = mag;
+        }
+    }
 
     let familiarity = knn.familiarity(&live_ind, knn_k);
     let sniper_inp  = sniper.build_input(window, &live_ind, &[]);
@@ -361,22 +380,17 @@ fn run_prediction(
     println!("━━━ Prediction from {} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         anchor_bar.ts.format("%Y-%m-%d %H:%M:%S"));
 
-    let fmt_pred = |map: &std::collections::HashMap<usize,(f64,f64)>, m: usize| -> String {
-        map.get(&m).map(|&(p,d)| format!("p={:.3} ({:>+.3})", d, p))
-           .unwrap_or_else(|| "       --         ".into())
-    };
-
     let has_actual  = !future.is_empty();
     let clean_dir   = |pct: f64| if pct >= 0.0 { "▲" } else { "▼" };
     let pass_header: String = (0..show_passes).map(|i| format!(" J{:<2}", i+1)).collect();
 
     if has_actual {
-        println!("  Min | AI pred%   | Confidence             | Dir | Actual (candle%)     |{}", pass_header);
-        println!("  ----|-----------|------------------------|-----|----------------------|{}",
+        println!("  Min | Dir   Prob  Mag%   | Confidence             | Actual (candle%)     |{}", pass_header);
+        println!("  ----|---------------------|------------------------|----------------------|{}",
             "-".repeat(show_passes * 4));
     } else {
-        println!("  Min | AI pred%   | Confidence             | Dir |{}", pass_header);
-        println!("  ----|-----------|------------------------|-----|{}",
+        println!("  Min | Dir   Prob  Mag%   | Confidence             |{}", pass_header);
+        println!("  ----|---------------------|------------------------|{}",
             "-".repeat(show_passes * 4));
     }
 
@@ -387,10 +401,8 @@ fn run_prediction(
         let bar   = confidence_bar(conf);
         let dir   = clean_dir(sniper_pct[m-1]);
 
-        // sniper_pct[m-1] is deviation from 0.5 — use as predicted % move signal
-        let pred_pct = sniper_pct[m-1] * 100.0;
-        let pred_str = format!("{:>+6.3}%", pred_pct);
-
+        let raw_prob   = sn_map.get(&m).map(|&(_,d,_)| d).unwrap_or(0.5);
+        let pred_str   = format!("{} {:.3}  {:>+.4}", clean_dir(sniper_pct[m-1]), raw_prob, sniper_mag[m-1]);
         let clean_bull = sniper_pct[m-1] >= 0.0;
         let pass_cols: String = jitter_passes_data[m-1][..show_passes].iter().map(|&p| {
             let agrees = (p >= 0.5) == clean_bull;
@@ -407,11 +419,11 @@ fn run_prediction(
                 format!("{:>+6.3}% / ${:<8.4} {}", pct*100.0, future[m-1].close,
                     if correct { "✓" } else { "✗" })
             } else { "  (no data)        ".into() };
-            println!("  {:>3} | {:<9} | {} {} {:.0}% | {} | {:<20} |{}",
-                actual_min, pred_str, bar, label, conf*100.0, dir, actual, pass_cols);
+            println!("  {:>3} | {:<21} | {} {} {:.0}% | {:<20} |{}",
+                actual_min, pred_str, bar, label, conf*100.0, actual, pass_cols);
         } else {
-            println!("  {:>3} | {:<9} | {} {} {:.0}% | {} |{}",
-                actual_min, pred_str, bar, label, conf*100.0, dir, pass_cols);
+            println!("  {:>3} | {:<21} | {} {} {:.0}% |{}",
+                actual_min, pred_str, bar, label, conf*100.0, pass_cols);
         }
     }
 
@@ -450,18 +462,21 @@ fn run_prediction(
     let bullish   = sniper_pct.iter().filter(|&&p| p > 0.0).count();
     let avg_pct   = sniper_pct.iter().sum::<f64>() / 10.0;
     let avg_conf  = confidences.iter().sum::<f64>() / 10.0;
-    let p10_price = sn_map.get(&10).map(|&(_,d)| d).unwrap_or(anchor);
+    let p10_price = sn_map.get(&10).map(|&(_,d,_)| d).unwrap_or(0.5);
     let direction = if avg_pct >= 0.0 { "▲ BULLISH" } else { "▼ BEARISH" };
 
     println!();
     println!("  ─────────────────────────────────────────────────");
     println!("  Consensus   : {}  ({}/10 bars agree)", direction, bullish.max(10-bullish));
-    println!("  Avg signal  : {:>+.4}  over next 10 minutes (0=neutral, ±0.5=max)", avg_pct);
+    let avg_mag = sniper_mag.iter().sum::<f64>() / 10.0;
+    println!("  Avg dir signal : {:>+.4}  (deviation from 0.5; positive=bullish, negative=bearish)", avg_pct);
+    println!("  Avg magnitude  : {:>+.4}  predicted mean % move per candle", avg_mag);
     println!("  Avg conf    : {:.0}%  {}  {}  (stab {:.0}% × fam {:.0}%)",
         avg_conf*100.0, confidence_label(avg_conf), confidence_bar(avg_conf),
         avg_stab*100.0, familiarity*100.0);
-    println!("  +10m prob   : {:.3}  ({} {:.1}% confidence)",
-        p10_price, if p10_price >= 0.5 { "▲ BULLISH" } else { "▼ BEARISH" },
+    println!("  +{}m dir prob : {:.3}  →  {} (signal strength {:.1}%)",
+        10 * interval_mins, p10_price,
+        if p10_price >= 0.5 { "▲ BULLISH" } else { "▼ BEARISH" },
         (p10_price - 0.5).abs() * 200.0);
 
     let correct = if has_actual && future.len() >= 10 {
@@ -600,9 +615,9 @@ fn main() {
         println!("━━━ Date-range backtest: {} → {}  (daily anchor {:02}:{:02} UTC) ━━━",
             from_date, to_date, hh, mm);
         let act_label = format!("Act{}m%", 10 * interval_mins);
-        println!("  {:<12} | {:>9} | {:>6} | {:>8} | {:>8} | {:>8} | {:<9}",
-            "Date", "Close", "Acc", "AvgConf", "Pred%", act_label, "Consensus");
-        println!("  {}", "-".repeat(75));
+        println!("  {:<12} | {:>9} | {:>5} | {:>7} | {:>7} | {:>8} | {:<9}",
+            "Date", "Close", "Acc", "Conf", "Mag%", act_label, "Consensus");
+        println!("  {}", "-".repeat(72));
 
         let mut results: Vec<DayResult> = Vec::new();
         let mut cur = from_date;
@@ -625,9 +640,9 @@ fn main() {
                             let acc_str = if dr.total > 0 { format!("{}/{}", dr.correct, dr.total) } else { "--".into() };
                             let act_str = dr.actual_pct_10.map(|p| format!("{:>+6.3}%", p*100.0)).unwrap_or("   --   ".into());
                             let cons    = if dr.consensus_dir { "▲ BULL" } else { "▼ BEAR" };
-                            println!("  {:<12} | {:>9.4} | {:>6} | {:>7.1}% | {:>+7.3}% | {} | {}",
+                            println!("  {:<12} | {:>9.4} | {:>5} | {:>6.1}% | {:>+6.4} | {} | {}",
                                 cur.to_string(), dr.anchor_price, acc_str, dr.avg_conf * 100.0,
-                                dr.avg_pct * 100.0, act_str, cons);
+                                dr.avg_mag, act_str, cons);
                             results.push(dr);
                         }
                     }

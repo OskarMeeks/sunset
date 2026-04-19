@@ -318,7 +318,10 @@ impl Layer {
         for o in 0..self.out_size {
             let off = o * self.in_size;
             let z = self.b[o] + self.w[off..off + self.in_size].iter().zip(inp).map(|(&w, &x)| w * x).sum::<f64>();
-            out[o] = if self.is_output { 1.0 / (1.0 + (-z).exp()) } else if z > 0.0 { z } else { 0.01 * z };
+            out[o] = if self.is_output {
+                if o % 2 == 0 { 1.0 / (1.0 + (-z).exp()) }  // direction: sigmoid
+                else           { z.clamp(-0.1, 0.1) }         // magnitude: linear, clamped to ±10%
+            } else if z > 0.0 { z } else { 0.01 * z };
         }
     }
 
@@ -383,16 +386,20 @@ impl Net {
             layers.push(Layer::new(prev, cfg.hidden, false, &mut rng));
             prev = cfg.hidden;
         }
-        layers.push(Layer::new(prev, target_offsets.len(), true, &mut rng));
+        layers.push(Layer::new(prev, target_offsets.len() * 2, true, &mut rng));
         Net { layers, target_offsets, lookback: cfg.lookback }
     }
 
     /// Convert to a cascade_core::net::Net for weight serialisation.
+    /// The core Net is blanked with target_offsets so its output layer has
+    /// target_offsets.len() nodes; we then replace every layer wholesale with
+    /// to_core_layer() which copies the actual weights — including the output
+    /// layer which has target_offsets.len()*2 nodes (direction + magnitude).
     fn to_core_net(&self) -> stock_tracker::cascade_core::net::Net {
+        let n_extra = self.layers[0].in_size - self.lookback * (NF + INDICATOR_NF);
         let mut cn = stock_tracker::cascade_core::net::Net::blank(
             self.target_offsets.clone(),
-            // n_extra = input_dim - lookback*(NF+INDICATOR_NF)
-            self.layers[0].in_size - self.lookback * (NF + INDICATOR_NF),
+            n_extra,
             &Config {
                 lookback: self.lookback,
                 hidden:   self.layers.first().map(|l| l.out_size).unwrap_or(128),
@@ -400,9 +407,10 @@ impl Net {
                 ..Config::default()
             },
         );
-        for (cl, tl) in cn.layers.iter_mut().zip(self.layers.iter()) {
-            *cl = tl.to_core_layer();
-        }
+        // Replace all layers (including output) with the actual trained weights.
+        // The output layer in cn was blanked with target_offsets.len() outputs but
+        // the real output has target_offsets.len()*2; rebuild it correctly.
+        cn.layers = self.layers.iter().map(|l| l.to_core_layer()).collect();
         cn
     }
 
@@ -422,9 +430,10 @@ impl Net {
         if n_samples == 0 { return vec![]; }
 
         let input_dim  = self.layers[0].in_size;
-        let target_dim = self.target_offsets.len();
+        let target_dim  = self.target_offsets.len();
+        let output_dim  = target_dim * 2;  // interleaved: [dir_0, mag_0, dir_1, mag_1, ...]
         let mut flat_inputs  = vec![0.0; n_samples * input_dim];
-        let mut flat_targets = vec![0.0; n_samples * target_dim];
+        let mut flat_targets = vec![0.0; n_samples * output_dim];
 
         for i in 0..n_samples {
             let anchor = data[i + self.lookback - 1].close.max(1e-8);
@@ -439,29 +448,32 @@ impl Net {
             flat_inputs[i*input_dim..(i+1)*input_dim].copy_from_slice(&inp);
             for (ti, &off) in self.target_offsets.iter().enumerate() {
                 let raw = (data[i+self.lookback+off].close - anchor) / anchor;
-                flat_targets[i*target_dim + ti] = if raw > 0.0 { 1.0 } else { 0.0 };
+                let mag = raw.clamp(-0.05, 0.05);  // cap at ±5% so outliers don't dominate
+                flat_targets[i*output_dim + ti*2    ] = if raw > 0.0 { 1.0 } else { 0.0 };  // direction
+                flat_targets[i*output_dim + ti*2 + 1] = mag;                                  // magnitude
             }
         }
 
         // ── Class balance weights ─────────────────────────────────────────────
+        // class weights only apply to direction outputs (even indices)
         let class_weight_pairs: Vec<(f64, f64)> = (0..target_dim).map(|ti| {
-            let pos   = (0..n_samples).filter(|&i| flat_targets[i*target_dim + ti] > 0.5).count();
+            let pos   = (0..n_samples).filter(|&i| flat_targets[i*output_dim + ti*2] > 0.5).count();
             let neg   = n_samples - pos;
             let pos_w = (neg as f64 / pos.max(1) as f64).clamp(0.5, 2.0);
             let neg_w = (pos as f64 / neg.max(1) as f64).clamp(0.5, 2.0);
             (pos_w, neg_w)
         }).collect();
         {
-            let (p0, n0) = { let p = (0..n_samples).filter(|&i| flat_targets[i*target_dim] > 0.5).count(); (p, n_samples - p) };
+            let (p0, n0) = { let p = (0..n_samples).filter(|&i| flat_targets[i*output_dim] > 0.5).count(); (p, n_samples - p) };
             let balance_str = if target_dim == 1 {
                 format!("{}↑ {}↓", p0, n0)
             } else {
-                let (pl, nl) = { let p = (0..n_samples).filter(|&i| flat_targets[i*target_dim + target_dim - 1] > 0.5).count(); (p, n_samples - p) };
+                let (pl, nl) = { let p = (0..n_samples).filter(|&i| flat_targets[i*output_dim + (target_dim-1)*2] > 0.5).count(); (p, n_samples - p) };
                 format!("+{}m {}↑{}↓ … +{}m {}↑{}↓",
                     (self.target_offsets[0] + 1) * cfg.bar_mins, p0, n0,
                     (self.target_offsets[target_dim-1] + 1) * cfg.bar_mins, pl, nl)
             };
-            println!("  Balance: {}  |  {} samples  |  {} outputs", balance_str, n_samples, target_dim);
+            println!("  Balance: {}  |  {} samples  |  {} outputs ({}dir + {}mag)", balance_str, n_samples, output_dim, target_dim, target_dim);
         }
 
         let ws_proto      = Workspace::new(&self.layers, input_dim);
@@ -537,17 +549,29 @@ impl Net {
                             let (left, right) = ws.acts.split_at_mut(l + 1);
                             layer.forward(&left[l], &mut right[0]);
                         }
-                        let targets  = &flat_targets[i*target_dim..(i+1)*target_dim];
+                        let targets  = &flat_targets[i*output_dim..(i+1)*output_dim];
                         let last_idx = self.layers.len();
-                        for (k, (&p, &t)) in ws.acts[last_idx].iter().zip(targets).enumerate() {
-                            let eps_bce = 1e-7_f64;
-                            let bce = -(t * (p + eps_bce).ln()
-                                      + (1.0 - t) * (1.0 - p + eps_bce).ln());
-                            let (pos_w, neg_w) = class_weight_pairs[k];
-                            let class_w = if t > 0.5 { pos_w } else { neg_w };
-                            ws.errors[k] = (p - t) * class_w;
-                            mse += bce;
-                            if (p > 0.5 && t > 0.5) || (p < 0.5 && t < 0.5) { correct += 1; }
+                        for k in 0..self.layers[last_idx - 1].out_size {
+                            let p = ws.acts[last_idx][k];
+                            let t = targets[k];
+                            if k % 2 == 0 {
+                                // direction output: BCE loss + class weighting
+                                let ti = k / 2;
+                                let eps_bce = 1e-7_f64;
+                                let bce = -(t * (p + eps_bce).ln()
+                                          + (1.0 - t) * (1.0 - p + eps_bce).ln());
+                                let (pos_w, neg_w) = class_weight_pairs[ti];
+                                let class_w = if t > 0.5 { pos_w } else { neg_w };
+                                ws.errors[k] = (p - t) * class_w;
+                                mse += bce;
+                                if (p > 0.5 && t > 0.5) || (p < 0.5 && t < 0.5) { correct += 1; }
+                            } else {
+                                // magnitude output: MSE loss scaled by dir_weight
+                                // derivative of (1/2 * mse * (p-t)^2) = mse * (p-t)
+                                // linear activation so no extra derivative term
+                                ws.errors[k] = cfg.dir_weight * (p - t);
+                                mse += cfg.dir_weight * 0.5 * (p - t).powi(2);
+                            }
                         }
                         let last_layer = last_idx - 1;
                         for o in 0..self.layers[last_layer].out_size {
@@ -722,7 +746,7 @@ impl Net {
         history
     }
 
-    fn predict(&self, data: &[StockData], _ind: &[f64; INDICATOR_NF], cascade: &[f64], _anchor: f64) -> HashMap<usize, (f64, f64)> {
+    fn predict(&self, data: &[StockData], _ind: &[f64; INDICATOR_NF], cascade: &[f64], _anchor: f64) -> HashMap<usize, (f64, f64, f64)> {
         let mut inp = Vec::with_capacity(self.layers[0].in_size);
         let ind0    = compute_indicators(&indicators::bars_from_cascade(&data[..1]));
         inp.extend_from_slice(&extract(&data[0], &data[0]));
@@ -740,9 +764,11 @@ impl Net {
             layer.forward(&left[l], &mut right[0]);
         }
         let preds = &ws.acts[self.layers.len()];
+        // output is interleaved: [dir_0, mag_0, dir_1, mag_1, ...]
         self.target_offsets.iter().enumerate().map(|(i, &off)| {
-            let prob = preds[i];
-            (off + 1, (prob - 0.5, prob))
+            let prob = preds[i * 2];       // direction: sigmoid output
+            let mag  = preds[i * 2 + 1];  // magnitude: linear output (predicted % move)
+            (off + 1, (prob - 0.5, prob, mag))
         }).collect()
     }
 
@@ -912,12 +938,12 @@ fn main() -> io::Result<()> {
             save_weights(&weights_out, &sym_cfg, &sniper);
 
             println!("━━━ [{}] Results (last 10 bars) ━━━━━━━━━━━━━━━━━━━━", sym_upper);
-            println!("  {:>4} | Sniper ({}-{})  | Actual", "Min", sym_cfg.bar_mins, 10*sym_cfg.bar_mins);
-            println!("  ----|------------------|--------");
+            println!("  {:>4} | {:<32} | Actual", "Min", format!("Sniper ({}-{})", sym_cfg.bar_mins, 10*sym_cfg.bar_mins));
+            println!("  ----|----------------------------------|--------");
             for m in 1..=10 {
                 let actual_pct = (data[r_end + m - 1].close - anchor) / anchor;
-                let pred = sn_live.get(&m).map(|(p, d)| format!("p={:.3} ({:>+.3})", d, p)).unwrap_or("      --        ".into());
-                println!("  {:>4} | {:<16} | {:>+6.3}%", m * sym_cfg.bar_mins, pred, actual_pct * 100.0);
+                let pred = sn_live.get(&m).map(|(p, d, mag)| format!("p={:.3} ({:>+.3}) mag={:>+.4}", d, p, mag)).unwrap_or("        --          ".into());
+                println!("  {:>4} | {:<32} | {:>+6.3}%", m * sym_cfg.bar_mins, pred, actual_pct * 100.0);
             }
 
             let mut tracker = TuningTracker::new(&format!("AI_Tuning_Log_{}.xlsx", sym_upper));
@@ -985,12 +1011,12 @@ fn main() -> io::Result<()> {
     }
 
     println!("━━━ [{}] Results ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", cfg.out_prefix);
-    println!("  {:>4} | Sniper ({}-{})  | Actual", "Min", cfg.bar_mins, 10*cfg.bar_mins);
-    println!("  ----|------------------|--------");
+    println!("  {:>4} | {:<32} | Actual", "Min", format!("Sniper ({}-{})", cfg.bar_mins, 10*cfg.bar_mins));
+    println!("  ----|----------------------------------|--------");
     for m in 1..=10 {
         let actual_pct = (data[r_end + m - 1].close - anchor) / anchor;
-        let pred = sn_live.get(&m).map(|&(p, d)| format!("p={:.3} ({:>+.3})", d, p)).unwrap_or("      --        ".into());
-        println!("  {:>4} | {:<16} | {:>+6.3}%", m * cfg.bar_mins, pred, actual_pct * 100.0);
+        let pred = sn_live.get(&m).map(|&(p, d, mag)| format!("p={:.3} ({:>+.3}) mag={:>+.4}", d, p, mag)).unwrap_or("        --          ".into());
+        println!("  {:>4} | {:<32} | {:>+6.3}%", m * cfg.bar_mins, pred, actual_pct * 100.0);
     }
 
     let mut tracker = TuningTracker::new("AI_Tuning_Log.xlsx");

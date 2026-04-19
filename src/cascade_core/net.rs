@@ -73,7 +73,8 @@ impl Layer {
                     .map(|(&w, &x)| w * x)
                     .sum::<f64>();
             out[o] = if self.is_output {
-                1.0 / (1.0 + (-z).exp())   // sigmoid
+                if o % 2 == 0 { 1.0 / (1.0 + (-z).exp()) }  // direction: sigmoid
+                else           { z.clamp(-0.1, 0.1) }         // magnitude: linear ±10%
             } else if z > 0.0 {
                 z                           // ReLU
             } else {
@@ -150,23 +151,26 @@ impl Net {
         acts
     }
 
-    /// Full cascade predict.  Returns a map of `(minute_offset → (direction_signal, probability))`.
+    /// Full cascade predict.  Returns a map of `(minute_offset → (direction_signal, probability, magnitude))`.
     ///
     /// * `direction_signal` = `probability − 0.5`  (positive = bullish, negative = bearish)
     /// * `probability`      = raw sigmoid output in (0, 1)
+    /// * `magnitude`        = predicted % price move (linear output, clamped ±10%)
     pub fn predict(
         &self,
         data:    &[StockData],
         ind:     &[f64; INDICATOR_NF],
         cascade: &[f64],
         anchor:  f64,
-    ) -> HashMap<usize, (f64, f64)> {
+    ) -> HashMap<usize, (f64, f64, f64)> {
         let _ = anchor; // retained for API compatibility; no longer used internally
-        let inp  = self.build_input(data, ind, cascade);
+        let inp   = self.build_input(data, ind, cascade);
         let preds = self.forward_raw(&inp);
+        // output is interleaved: [dir_0, mag_0, dir_1, mag_1, ...]
         self.target_offsets.iter().enumerate().map(|(i, &off)| {
-            let prob = preds[i];
-            (off + 1, (prob - 0.5, prob))
+            let prob = preds[i * 2];       // direction: sigmoid
+            let mag  = preds[i * 2 + 1];  // magnitude: linear ±10%
+            (off + 1, (prob - 0.5, prob, mag))
         }).collect()
     }
 
@@ -174,9 +178,9 @@ impl Net {
 
     /// Add small uniform noise to `inp` `n_passes` times and measure what
     /// fraction of noisy forward passes agree with the clean prediction direction
-    /// for `target_i` (index into `target_offsets`).
+    /// for offset index `target_i` (index into `target_offsets`, not raw neuron index).
     ///
-    /// Returns `(stability_fraction, per_pass_raw_outputs)`.
+    /// Returns `(stability_fraction, per_pass_raw_direction_outputs)`.
     /// * `stability = 1.0` → decisive (all passes agree)
     /// * `stability = 0.5` → coin-flip (model is on a decision boundary)
     pub fn stability(
@@ -186,8 +190,10 @@ impl Net {
         n_passes:  usize,
         noise_std: f64,
     ) -> (f64, Vec<f64>) {
-        let clean     = self.forward_raw(inp);
-        let direction = clean[target_i] >= 0.5; // sigmoid ≥ 0.5 = bullish
+        // direction neuron for offset i is at index i*2 (magnitude is at i*2+1)
+        let dir_neuron = target_i * 2;
+        let clean      = self.forward_raw(inp);
+        let direction  = clean[dir_neuron] >= 0.5; // sigmoid ≥ 0.5 = bullish
         let mut agree = 0usize;
         let mut pass_pcts: Vec<f64> = Vec::with_capacity(n_passes);
         let mut rng = 0xc0ffee_u64;
@@ -198,7 +204,7 @@ impl Net {
                 let u = (rng >> 1) as f64 / i64::MAX as f64 - 1.0; // [-1, 1]
                 x + u * noise_std
             }).collect();
-            let out = self.forward_raw(&noisy)[target_i];
+            let out = self.forward_raw(&noisy)[dir_neuron];
             pass_pcts.push(out);
             if (out >= 0.5) == direction { agree += 1; }
         }
@@ -248,9 +254,16 @@ impl Net {
             let in_sz  = read_u64!() as usize;
             let out_sz = read_u64!() as usize;
             let is_out = read_u64!() != 0;
-            assert_eq!(in_sz,  l.in_size,   "Layer in_size mismatch");
-            assert_eq!(out_sz, l.out_size,  "Layer out_size mismatch");
-            assert_eq!(is_out, l.is_output, "Layer is_output mismatch");
+            assert_eq!(in_sz,  l.in_size,  "Layer in_size mismatch");
+            assert_eq!(is_out, l.is_output,"Layer is_output mismatch");
+            // out_size may differ when loading old weights (e.g. pre-magnitude output
+            // had 10 outputs; new format has 20). Resize the layer to match the file.
+            if out_sz != l.out_size {
+                l.out_size = out_sz;
+                l.w   = vec![0.0; in_sz * out_sz];
+                l.w_t = vec![0.0; in_sz * out_sz];
+                l.b   = vec![0.0; out_sz];
+            }
             for w in &mut l.w { *w = read_f64!(); }
             for b in &mut l.b { *b = read_f64!(); }
             l.sync_transpose();

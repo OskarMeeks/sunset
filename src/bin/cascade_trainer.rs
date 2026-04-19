@@ -459,21 +459,21 @@ impl Net {
         let class_weight_pairs: Vec<(f64, f64)> = (0..target_dim).map(|ti| {
             let pos   = (0..n_samples).filter(|&i| flat_targets[i*output_dim + ti*2] > 0.5).count();
             let neg   = n_samples - pos;
-            let pos_w = (neg as f64 / pos.max(1) as f64).clamp(0.5, 2.0);
-            let neg_w = (pos as f64 / neg.max(1) as f64).clamp(0.5, 2.0);
+            let pos_w = (neg as f64 / pos.max(1) as f64).clamp(0.5, 5.0);
+            let neg_w = (pos as f64 / neg.max(1) as f64).clamp(0.5, 5.0);
             (pos_w, neg_w)
         }).collect();
         {
             let (p0, n0) = { let p = (0..n_samples).filter(|&i| flat_targets[i*output_dim] > 0.5).count(); (p, n_samples - p) };
             let balance_str = if target_dim == 1 {
-                format!("{}↑ {}↓", p0, n0)
+                format!("{}↑ {}↓  ({:.1}% bull)", p0, n0, p0 as f64 / n_samples as f64 * 100.0)
             } else {
                 let (pl, nl) = { let p = (0..n_samples).filter(|&i| flat_targets[i*output_dim + (target_dim-1)*2] > 0.5).count(); (p, n_samples - p) };
-                format!("+{}m {}↑{}↓ … +{}m {}↑{}↓",
-                    (self.target_offsets[0] + 1) * cfg.bar_mins, p0, n0,
-                    (self.target_offsets[target_dim-1] + 1) * cfg.bar_mins, pl, nl)
+                format!("+{}m {}↑{}↓({:.1}%bull) … +{}m {}↑{}↓({:.1}%bull)",
+                    (self.target_offsets[0] + 1) * cfg.bar_mins, p0, n0, p0 as f64 / n_samples as f64 * 100.0,
+                    (self.target_offsets[target_dim-1] + 1) * cfg.bar_mins, pl, nl, pl as f64 / n_samples as f64 * 100.0)
             };
-            println!("  Balance: {}  |  {} samples  |  {} outputs ({}dir + {}mag)", balance_str, n_samples, output_dim, target_dim, target_dim);
+            println!("  Balance: {}  |  {} samples  |  {} outputs ({}dir + {}mag)  |  class weight clamp ±5×", balance_str, n_samples, output_dim, target_dim, target_dim);
         }
 
         let ws_proto      = Workspace::new(&self.layers, input_dim);
@@ -742,6 +742,18 @@ impl Net {
             "─".repeat(7), "─".repeat(11), "─".repeat(10));
         println!("  ✓ best acc {:.2}%  |  pred spread: min={:.3} max={:.3} std={:.4}{}",
             best_acc, p_min, p_max, p_std, spread_flag);
+
+        // Print output layer biases — if all direction biases are negative the model
+        // has collapsed to a bearish prior; retrain with more epochs or higher LR.
+        let out_layer = self.layers.last().unwrap();
+        let dir_biases: Vec<String> = (0..out_layer.out_size)
+            .filter(|o| o % 2 == 0)
+            .map(|o| format!("{:>+.3}", out_layer.b[o]))
+            .collect();
+        let all_neg = dir_biases.iter().all(|s| s.starts_with('-'));
+        println!("  Direction biases (output layer): [{}]{}",
+            dir_biases.join(", "),
+            if all_neg { "  ⚠ ALL NEGATIVE — model collapsed to bearish prior, try higher --dir-weight or more epochs" } else { "" });
 
         history
     }

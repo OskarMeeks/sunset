@@ -252,7 +252,7 @@ fn run_day_verbose(
         let label_c   = confidence_label(conf);
         let dir        = clean_dir(sniper_pct[m-1]);
         let raw_prob   = sn_map.get(&m).map(|&(_,d,_)| d).unwrap_or(0.5);
-        let pred_str   = format!("{} {:.3}  {:>+.4}", dir, raw_prob, sniper_mag[m-1]);
+        let pred_str   = format!("{} {:.3}  {:>+.4}%", dir, raw_prob, sniper_mag[m-1] * 100.0);
         let clean_bull = sniper_pct[m-1] >= 0.0;
         let pass_cols: String = jitter_data[m-1][..show_passes].iter().map(|&p| {
             let agrees = (p >= 0.5) == clean_bull;
@@ -402,7 +402,7 @@ fn run_prediction(
         let dir   = clean_dir(sniper_pct[m-1]);
 
         let raw_prob   = sn_map.get(&m).map(|&(_,d,_)| d).unwrap_or(0.5);
-        let pred_str   = format!("{} {:.3}  {:>+.4}", clean_dir(sniper_pct[m-1]), raw_prob, sniper_mag[m-1]);
+        let pred_str   = format!("{} {:.3}  {:>+.4}%", clean_dir(sniper_pct[m-1]), raw_prob, sniper_mag[m-1] * 100.0);
         let clean_bull = sniper_pct[m-1] >= 0.0;
         let pass_cols: String = jitter_passes_data[m-1][..show_passes].iter().map(|&p| {
             let agrees = (p >= 0.5) == clean_bull;
@@ -470,7 +470,7 @@ fn run_prediction(
     println!("  Consensus   : {}  ({}/10 bars agree)", direction, bullish.max(10-bullish));
     let avg_mag = sniper_mag.iter().sum::<f64>() / 10.0;
     println!("  Avg dir signal : {:>+.4}  (deviation from 0.5; positive=bullish, negative=bearish)", avg_pct);
-    println!("  Avg magnitude  : {:>+.4}  predicted mean % move per candle", avg_mag);
+    println!("  Avg magnitude  : {:>+.4}%  predicted mean % move per candle", avg_mag * 100.0);
     println!("  Avg conf    : {:.0}%  {}  {}  (stab {:.0}% × fam {:.0}%)",
         avg_conf*100.0, confidence_label(avg_conf), confidence_bar(avg_conf),
         avg_stab*100.0, familiarity*100.0);
@@ -640,9 +640,9 @@ fn main() {
                             let acc_str = if dr.total > 0 { format!("{}/{}", dr.correct, dr.total) } else { "--".into() };
                             let act_str = dr.actual_pct_10.map(|p| format!("{:>+6.3}%", p*100.0)).unwrap_or("   --   ".into());
                             let cons    = if dr.consensus_dir { "▲ BULL" } else { "▼ BEAR" };
-                            println!("  {:<12} | {:>9.4} | {:>5} | {:>6.1}% | {:>+6.4} | {} | {}",
+                            println!("  {:<12} | {:>9.4} | {:>5} | {:>6.1}% | {:>+6.4}% | {} | {}",
                                 cur.to_string(), dr.anchor_price, acc_str, dr.avg_conf * 100.0,
-                                dr.avg_mag, act_str, cons);
+                                dr.avg_mag * 100.0, act_str, cons);
                             results.push(dr);
                         }
                     }

@@ -33,3 +33,14 @@ cargo build --release && ./target/release/scan_predict AAPL.weights --symbol AAP
 ./target/release/scan_predict AAPL.weights --symbol AAPL \
     --api-key 8a72215b906449f29ba9e6063f5ccecb \
     --from 2026-02-01 --to 2026-03-10 --interval 5
+
+
+    RUSTFLAGS="-C target-cpu=native" cargo build --release && ./target/release/cascade_trainer AAPL \
+  --lookback 60 --hidden 128 --layers 2 \
+  --epochs3 300 --lr3 5e-4 \
+  --lr-decay 0.995 \
+  --l2-lambda 1e-4 --dir-weight 1.5 \
+  --interval 5 --batch-size 4096 \
+  --save-weights AAPL.weights --early-stop 30 \
+  --start-date 2021-03-16 --end-date 2026-03-16 \
+  --api-key 8a72215b906449f29ba9e6063f5ccecb

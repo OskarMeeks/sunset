@@ -32,7 +32,9 @@
 //   [16] Volume ratio (vs 20-bar avg) — unusual volume flag
 //   [17] Candle body ratio            — bar structure (doji vs engulfing)
 
-pub const INDICATOR_NF: usize = 18;
+/// 18 indicators computed at 4 points across the lookback window (25/50/75/100%).
+/// The model sees how each indicator evolved, not just its current value.
+pub const INDICATOR_NF: usize = 72;
 
 /// A minimal bar type accepted by this module. Your StockData can be
 /// converted via the `AsBar` trait below (or just pass slices directly).
@@ -293,16 +295,41 @@ pub fn candle_body(bar: &Bar) -> f64 {
 //  Master feature extractor
 // ─────────────────────────────────────────────
 
-/// Compute all INDICATOR_NF technical features from a lookback window of bars.
+/// Compute INDICATOR_NF features from a lookback window of bars.
 ///
-/// Call this once per training sample with the full lookback slice.
-/// All features are normalised to roughly [-1, 1] or [0, 1].
+/// Indicators are computed at 4 evenly-spaced time slices across the window
+/// (at 25%, 50%, 75%, and 100% of the window length), giving the model
+/// trajectory information rather than just a single snapshot.
+///
+/// Output: 18 indicators × 4 slices = 72 features, all in roughly [-1, 1].
 ///
 /// # Panics
 /// Requires `bars.len() >= 27` (26-period MACD minimum).
 pub fn compute_indicators(bars: &[Bar]) -> [f64; INDICATOR_NF] {
+    let n = bars.len();
+    // Slice endpoints: 25%, 50%, 75%, 100% of the window, each at least 27 bars
+    let slices = [
+        (n / 4).max(27),
+        (n / 2).max(27),
+        (3 * n / 4).max(27),
+        n,
+    ];
+
+    let mut out = [0.0f64; INDICATOR_NF];
+    for (t, &end) in slices.iter().enumerate() {
+        let end   = end.min(n);
+        let slice = &bars[..end];
+        let feats = compute_snapshot(slice);
+        for i in 0..18 {
+            out[t * 18 + i] = feats[i];
+        }
+    }
+    out
+}
+
+/// Compute the 18-feature snapshot at a single point in time.
+fn compute_snapshot(bars: &[Bar]) -> [f64; 18] {
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-    let _n = closes.len();
 
     // ── Trend (EMA) ─────────────────────────────────────────────
     let ema9  = ema(&closes, 9);
@@ -311,54 +338,43 @@ pub fn compute_indicators(bars: &[Bar]) -> [f64; INDICATOR_NF] {
 
     let ema9_dist  = ((close - ema9)  / close.max(1e-8)).clamp(-0.05, 0.05) / 0.05;
     let ema21_dist = ((close - ema21) / close.max(1e-8)).clamp(-0.05, 0.05) / 0.05;
-    let ema9_slp   = ema_slope(&closes, 9) / 0.02;           // normalise slope
-    let ema_cross  = if ema9 > ema21 { 1.0 } else { -1.0 };  // binary crossover
+    let ema9_slp   = ema_slope(&closes, 9) / 0.02;
+    let ema_cross  = if ema9 > ema21 { 1.0 } else { -1.0 };
 
     // ── Momentum ────────────────────────────────────────────────
-    let rsi14        = rsi(&closes, 14) * 2.0 - 1.0;         // remap [0,1] → [-1,1]
+    let rsi14              = rsi(&closes, 14) * 2.0 - 1.0;
     let (macd_hist, macd_sign) = macd(&closes);
-    let macd_h_norm  = macd_hist / 0.01;                      // normalise histogram
+    let macd_h_norm        = macd_hist / 0.01;
 
     // ── Volatility ──────────────────────────────────────────────
-    let (pct_b, bw)  = bollinger(&closes, 20);
-    let pct_b_norm   = pct_b * 2.0 - 1.0;                    // [0,1] → [-1,1]
-    let bw_norm      = (bw / 0.1).clamp(0.0, 1.0);
-    let atr_r        = atr_ratio(bars, 14) * 2.0 - 1.0;      // [0,1] → [-1,1]
+    let (pct_b, bw) = bollinger(&closes, 20);
+    let pct_b_norm  = pct_b * 2.0 - 1.0;
+    let bw_norm     = (bw / 0.1).clamp(0.0, 1.0);
+    let atr_r       = atr_ratio(bars, 14) * 2.0 - 1.0;
 
     // ── Support / Resistance ─────────────────────────────────────
     let (sup_dist, res_dist, sr_strength) = pivot_sr(bars);
-    let sup_norm = sup_dist * 2.0 - 1.0;                      // 0=at support, 1=far above
-    let res_norm = 1.0 - res_dist * 2.0;                      // 1=at resistance, -1=far below
+    let sup_norm = sup_dist * 2.0 - 1.0;
+    let res_norm = 1.0 - res_dist * 2.0;
 
     // ── VWAP ────────────────────────────────────────────────────
     let (vwap_dist, vwap_slp) = vwap_features(bars);
 
     // ── Volume ──────────────────────────────────────────────────
-    let obv_mom  = obv_momentum(bars);
-    let vol_rat  = volume_ratio(bars, 20) * 2.0 - 1.0;        // [0,1] → [-1,1]
+    let obv_mom = obv_momentum(bars);
+    let vol_rat = volume_ratio(bars, 20) * 2.0 - 1.0;
 
     // ── Candle ──────────────────────────────────────────────────
     let body = candle_body(bars.last().unwrap());
 
     [
-        ema9_dist,    // [0]  EMA(9) distance
-        ema21_dist,   // [1]  EMA(21) distance
-        ema9_slp,     // [2]  EMA(9) slope
-        ema_cross,    // [3]  EMA crossover signal
-        rsi14,        // [4]  RSI(14) normalised
-        macd_h_norm,  // [5]  MACD histogram
-        macd_sign,    // [6]  MACD signal direction
-        pct_b_norm,   // [7]  Bollinger %B
-        bw_norm,      // [8]  Bollinger bandwidth
-        atr_r,        // [9]  ATR ratio
-        sup_norm,     // [10] Support distance
-        res_norm,     // [11] Resistance distance
-        sr_strength,  // [12] SR cluster strength
-        vwap_dist,    // [13] VWAP distance
-        vwap_slp,     // [14] VWAP slope
-        obv_mom,      // [15] OBV momentum
-        vol_rat,      // [16] Volume ratio
-        body,         // [17] Candle body ratio
+        ema9_dist, ema21_dist, ema9_slp, ema_cross,
+        rsi14, macd_h_norm, macd_sign,
+        pct_b_norm, bw_norm, atr_r,
+        sup_norm, res_norm, sr_strength,
+        vwap_dist, vwap_slp,
+        obv_mom, vol_rat,
+        body,
     ]
 }
 

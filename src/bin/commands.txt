@@ -1,0 +1,9 @@
+RUSTFLAGS="-C target-cpu=native" cargo build --release && ./target/release/stop_ai train   --csv AAPL   -a 60   --weights AAPL.weights   --epochs 300   --lr 5e-4   --start-date 2021-03-16   --end-date 2026-03-16   --api-key 8a72215b906449f29ba9e6063f5ccecb
+
+
+cargo run --bin chart_preview -- --csv AAPL_data.csv -a 60 --weights /home/oskar/sunset2/AAPL.weights --range-start 2026-03-16 --range-end 2026-04-16 --samples 10
+
+
+
+
+ok so right now the main thing is the ent ratio, i can only push the amount of trades entered as low as i can scan other.

@@ -8,12 +8,8 @@ name = "stock_tracker"
 path = "src/lib.rs"
 
 [[bin]]
-name = "cascade_trainer"
-path = "src/bin/cascade_trainer.rs"
-
-[[bin]]
-name = "scan_predict"
-path = "src/bin/scan_predict.rs"
+name = "stop_ai"
+path = "src/bin/stop_ai.rs"
 
 [dependencies]
 chrono     = { version = "0.4", features = ["serde"] }

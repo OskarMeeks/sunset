@@ -6,7 +6,7 @@
 // All outputs are normalised to roughly [-1, 1] so the network sees
 // consistent magnitude regardless of price level.
 //
-// Feature groups (total: INDICATOR_NF = 18):
+// Feature groups (total: INDICATOR_NF = 144 = 18 indicators × 8 time slices):
 //
 //   [0]  EMA(9)  distance from close  — trend short
 //   [1]  EMA(21) distance from close  — trend medium
@@ -32,9 +32,9 @@
 //   [16] Volume ratio (vs 20-bar avg) — unusual volume flag
 //   [17] Candle body ratio            — bar structure (doji vs engulfing)
 
-/// 18 indicators computed at 4 points across the lookback window (25/50/75/100%).
+/// 18 indicators computed at 8 points across the lookback window (12.5/25/.../100%).
 /// The model sees how each indicator evolved, not just its current value.
-pub const INDICATOR_NF: usize = 72;
+pub const INDICATOR_NF: usize = 144;
 
 /// A minimal bar type accepted by this module. Your StockData can be
 /// converted via the `AsBar` trait below (or just pass slices directly).
@@ -297,21 +297,24 @@ pub fn candle_body(bar: &Bar) -> f64 {
 
 /// Compute INDICATOR_NF features from a lookback window of bars.
 ///
-/// Indicators are computed at 4 evenly-spaced time slices across the window
-/// (at 25%, 50%, 75%, and 100% of the window length), giving the model
-/// trajectory information rather than just a single snapshot.
+/// Indicators are computed at 8 evenly-spaced time slices across the window
+/// (at 12.5%, 25%, 37.5%, 50%, 62.5%, 75%, 87.5%, and 100% of the window length),
+/// giving the model richer trajectory information rather than a coarse 4-point snapshot.
 ///
-/// Output: 18 indicators × 4 slices = 72 features, all in roughly [-1, 1].
+/// Output: 18 indicators × 8 slices = 144 features, all in roughly [-1, 1].
 ///
 /// # Panics
 /// Requires `bars.len() >= 27` (26-period MACD minimum).
 pub fn compute_indicators(bars: &[Bar]) -> [f64; INDICATOR_NF] {
     let n = bars.len();
-    // Slice endpoints: 25%, 50%, 75%, 100% of the window, each at least 27 bars
     let slices = [
+        (n / 8).max(27),
         (n / 4).max(27),
+        (3 * n / 8).max(27),
         (n / 2).max(27),
+        (5 * n / 8).max(27),
         (3 * n / 4).max(27),
+        (7 * n / 8).max(27),
         n,
     ];
 

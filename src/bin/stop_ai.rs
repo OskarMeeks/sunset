@@ -39,19 +39,23 @@ use stock_tracker::indicators::{compute_indicators, Bar, INDICATOR_NF};
 
 use std::{env, fs, process};
 use std::time::Instant;
+use rayon::prelude::*;
 
 // ═══════════════════════════════════════════════════════════════════
 //  Architecture hyper-parameters
 // ═══════════════════════════════════════════════════════════════════
 
 /// Number of 5-min candles to look forward when labelling training samples.
+/// 20 bars ≈ 100 minutes.  Doubling from 10 gives TP enough runway to exceed
+/// SL in absolute ATR distance, which is impossible in a 50-minute window for
+/// most low-volatility intraday moves.
 const FORWARD: usize = 20; // ≈ 100 minutes
 
 
 const MAX_MULT: f64 = 4.0;
 
 // MLP layer widths
-const NIN: usize = INDICATOR_NF; // 72 (18 indicators × 4 time slices)
+const NIN: usize = INDICATOR_NF; // 144 (18 indicators × 8 time slices)
 const H1:  usize = 256;
 const H2:  usize = 128;
 /// Outputs: [direction_logit, sl_mult_raw, tp_mult_raw]
@@ -60,8 +64,55 @@ const H2:  usize = 128;
 ///   raw[2] → sigmoid scaled → TP distance in ATR units  ∈ [0.5, MAX_MULT]
 const NOUT: usize = 3;
 
-/// Weight of the cap% surrogate loss relative to direction BCE loss.
-const LAMBDA_REG: f64 = 0.5;
+/// Weight of the R-multiple surrogate loss relative to direction BCE loss.
+/// Lowered to 0.40 so the direction BCE head gets more gradient signal —
+/// previously at 0.75 the R-multiple loss dominated, letting direction
+/// overfit on train while staying near-random on val.
+const LAMBDA_REG: f64 = 0.40;
+
+/// Minimum acceptable R:R ratio (TP distance / SL distance).
+/// A squared-hinge penalty fires whenever tp_pred / sl_pred < MIN_RR,
+/// pushing TP up and SL down until the ratio is met.
+/// 1.5 means the model must target at least 1.5× reward per unit of risk.
+/// Tune: raise toward 2.0 for stricter R:R; lower toward 1.0 to relax.
+const MIN_RR: f64 = 1.5;
+
+/// Weight of the R:R floor penalty relative to the direction BCE loss.
+/// Larger values enforce the floor more aggressively at the cost of some
+/// flexibility in SL/TP placement.
+const LAMBDA_RR: f64 = 0.30;
+
+/// L2 weight-decay coefficient applied inside the Adam update.
+/// Penalises large weights and is the primary defence against overfitting.
+/// Tune: increase toward 1e-3 if trn/val gap persists; decrease to 1e-5 if underfitting.
+const WEIGHT_DECAY: f64 = 2e-4;
+
+/// Inverted-dropout keep probability for hidden layers during training.
+/// 0.45 means 45 % of units are zeroed each forward pass — raised from 0.30
+/// to counteract direction-classifier overfitting (trn climbing while val flat).
+/// Set to 0.0 to disable dropout entirely.
+const DROPOUT: f64 = 0.45;
+
+/// Early-stopping patience: stop training if val PNL has not improved
+/// for this many consecutive reporting intervals (every 5 epochs).
+const PATIENCE: usize = 30;
+
+/// Minimum distance of dir_prob from the 0.5 decision boundary before we
+/// consider a signal tradeable.  A sample with dir_prob=0.52 is barely more
+/// than a coin-flip; we skip it.  Only samples where
+///   |dir_prob - 0.5| >= CONFIDENCE_THRESHOLD
+/// are simulated in validation, holdout, eval, and live predict.
+///
+/// 0.08 ≈ "model says at least 58% confident" before entering a trade.
+/// Tune:  raise toward 0.12–0.15 to trade less but with higher quality;
+///        lower toward 0.04 to trade nearly everything again.
+const CONFIDENCE_THRESHOLD: f64 = 0.08;
+
+/// Mini-batch size used inside each epoch.
+/// 4096 keeps all 18 Rayon threads saturated with ~228 samples each,
+/// maximising AVX2 throughput while still updating Adam more often than
+/// a full-dataset pass would.
+const BATCH_SIZE: usize = 4096;
 
 // ── Label generation parameters ───────────────────────────────────
 /// Fixed SL/TP ratio used ONLY to determine trade direction during labelling.
@@ -132,6 +183,22 @@ impl Rng {
 #[inline] #[allow(dead_code)] fn tanh_d(x: f64) -> f64   { let t = x.tanh(); 1.0 - t * t }
 
 // ═══════════════════════════════════════════════════════════════════
+//  Forward-pass cache (carries dropout masks needed for backprop)
+// ═══════════════════════════════════════════════════════════════════
+
+struct FwdCache {
+    pre1:  Vec<f64>,
+    /// Post-ReLU + dropout activations for layer 1.
+    h1:    Vec<f64>,
+    /// Inverted-dropout scale factor per unit: 0.0 (dropped) or 1/(1-p) (kept).
+    mask1: Vec<f64>,
+    pre2:  Vec<f64>,
+    h2:    Vec<f64>,
+    mask2: Vec<f64>,
+    raw:   Vec<f64>,
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  MLP  (flat-Vec storage for easy serialisation)
 //
 //  Layer indexing:
@@ -161,42 +228,74 @@ impl Mlp {
         }
     }
 
-    /// Forward pass.  Returns all intermediate values needed for backprop.
-    ///
-    /// Returns: (pre1, h1, pre2, h2, raw_out)
-    ///   pre* = pre-activation (before ReLU)
-    ///   h*   = post-activation
-    ///   raw  = final layer without any activation applied
-    fn forward_full(&self, x: &[f64])
-        -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)
-    {
+    /// Dot product of two slices.  Written as an iterator zip-sum so the
+    /// compiler can auto-vectorise to AVX2+FMA with `-C target-cpu=native`.
+    #[inline(always)]
+    fn dot(a: &[f64], b: &[f64]) -> f64 {
+        a.iter().zip(b.iter()).map(|(&ai, &bi)| ai * bi).sum()
+    }
+
+    /// Training forward pass with inverted dropout.
+    /// `rng` is a per-sample local RNG — safe to call from parallel threads.
+    fn forward_train(&self, x: &[f64], rng: &mut Rng) -> FwdCache {
+        let scale = if DROPOUT > 0.0 { 1.0 / (1.0 - DROPOUT) } else { 1.0 };
+
+        // ── Hidden layer 1 ──
+        // Each row of w1 is contiguous (j*NIN .. j*NIN+NIN), so dot() sees
+        // a sequential slice — optimal for AVX2 gather-free vectorisation.
+        let mut pre1 = vec![0.0f64; H1];
+        for j in 0..H1 {
+            pre1[j] = self.b1[j] + Self::dot(&self.w1[j * NIN..j * NIN + NIN], x);
+        }
+        let mut mask1 = vec![scale; H1];
+        let h1: Vec<f64> = pre1.iter().enumerate().map(|(j, &v)| {
+            if DROPOUT > 0.0 && rng.f64() < DROPOUT { mask1[j] = 0.0; 0.0 }
+            else { relu(v) * scale }
+        }).collect();
+
+        // ── Hidden layer 2 ──
+        let mut pre2 = vec![0.0f64; H2];
+        for j in 0..H2 {
+            pre2[j] = self.b2[j] + Self::dot(&self.w2[j * H1..j * H1 + H1], &h1);
+        }
+        let mut mask2 = vec![scale; H2];
+        let h2: Vec<f64> = pre2.iter().enumerate().map(|(j, &v)| {
+            if DROPOUT > 0.0 && rng.f64() < DROPOUT { mask2[j] = 0.0; 0.0 }
+            else { relu(v) * scale }
+        }).collect();
+
+        // ── Output layer (raw — activations applied outside) ──
+        let raw: Vec<f64> = (0..NOUT)
+            .map(|j| self.b3[j] + Self::dot(&self.w3[j * H2..j * H2 + H2], &h2))
+            .collect();
+
+        FwdCache { pre1, h1, mask1, pre2, h2, mask2, raw }
+    }
+
+    /// Inference forward pass — no dropout, deterministic.
+    fn forward_infer(&self, x: &[f64]) -> FwdCache {
         // ── Hidden layer 1 ──
         let mut pre1 = vec![0.0f64; H1];
         for j in 0..H1 {
-            let mut s = self.b1[j];
-            for i in 0..NIN { s += self.w1[j * NIN + i] * x[i]; }
-            pre1[j] = s;
+            pre1[j] = self.b1[j] + Self::dot(&self.w1[j * NIN..j * NIN + NIN], x);
         }
+        let mask1 = vec![1.0f64; H1];
         let h1: Vec<f64> = pre1.iter().map(|&v| relu(v)).collect();
 
         // ── Hidden layer 2 ──
         let mut pre2 = vec![0.0f64; H2];
         for j in 0..H2 {
-            let mut s = self.b2[j];
-            for i in 0..H1 { s += self.w2[j * H1 + i] * h1[i]; }
-            pre2[j] = s;
+            pre2[j] = self.b2[j] + Self::dot(&self.w2[j * H1..j * H1 + H1], &h1);
         }
+        let mask2 = vec![1.0f64; H2];
         let h2: Vec<f64> = pre2.iter().map(|&v| relu(v)).collect();
 
         // ── Output layer (raw — activations applied outside) ──
-        let mut raw = vec![0.0f64; NOUT];
-        for j in 0..NOUT {
-            let mut s = self.b3[j];
-            for i in 0..H2 { s += self.w3[j * H2 + i] * h2[i]; }
-            raw[j] = s;
-        }
+        let raw: Vec<f64> = (0..NOUT)
+            .map(|j| self.b3[j] + Self::dot(&self.w3[j * H2..j * H2 + H2], &h2))
+            .collect();
 
-        (pre1, h1, pre2, h2, raw)
+        FwdCache { pre1, h1, mask1, pre2, h2, mask2, raw }
     }
 
     /// Inference-only forward. Returns (dir_prob, sl_mult, tp_mult).
@@ -205,12 +304,10 @@ impl Mlp {
     /// - sl_mult  ∈ [0.3, MAX_MULT]: learned SL distance in ATR units
     /// - tp_mult  ∈ [0.5, MAX_MULT]: learned TP distance in ATR units
     fn predict(&self, x: &[f64]) -> (f64, f64, f64) {
-        let (_, _, _, _, raw) = self.forward_full(x);
-        let dir_prob = sigmoid(raw[0]);
-        // Sigmoid-scale raw outputs into [min, MAX_MULT] ranges.
-        // sigmoid(raw[1]) maps to (0,1); we stretch to [0.3, MAX_MULT].
-        let sl_mult = (0.3 + sigmoid(raw[1]) * (MAX_MULT - 0.3)).clamp(0.3, MAX_MULT);
-        let tp_mult = (0.5 + sigmoid(raw[2]) * (MAX_MULT - 0.5)).clamp(0.5, MAX_MULT);
+        let cache = self.forward_infer(x);
+        let dir_prob = sigmoid(cache.raw[0]);
+        let sl_mult = (0.3 + sigmoid(cache.raw[1]) * (MAX_MULT - 0.3)).clamp(0.3, MAX_MULT);
+        let tp_mult = (0.5 + sigmoid(cache.raw[2]) * (MAX_MULT - 0.5)).clamp(0.5, MAX_MULT);
         (dir_prob, sl_mult, tp_mult)
     }
 
@@ -297,8 +394,10 @@ impl Adam {
         macro_rules! update {
             ($p:expr, $m:expr, $v:expr, $g:expr) => {
                 for k in 0..$p.len() {
-                    $m[k] = b1 * $m[k] + (1.0 - b1) * $g[k];
-                    $v[k] = b2 * $v[k] + (1.0 - b2) * $g[k] * $g[k];
+                    // AdamW: fold L2 penalty into the gradient before moment update.
+                    let g_wd = $g[k] + WEIGHT_DECAY * $p[k];
+                    $m[k] = b1 * $m[k] + (1.0 - b1) * g_wd;
+                    $v[k] = b2 * $v[k] + (1.0 - b2) * g_wd * g_wd;
                     $p[k] -= lr_t * $m[k] / ($v[k].sqrt() + eps);
                 }
             };
@@ -324,26 +423,60 @@ impl Adam {
 //  Returns (dir_loss, reg_loss) for logging.
 // ═══════════════════════════════════════════════════════════════════
 
-fn backprop_step(
-    mlp:         &mut Mlp,
-    adam:        &mut Adam,
-    x:           &[f64],
-    dir_lbl:     f64,
-    // sl_lbl / tp_lbl / sl_mae_raw / tp_mfe_raw are no longer used for the
-    // SL/TP loss — the cap% surrogate replaces them — but we keep the
-    // signature compatible so the call-site doesn't need to change.
-    _sl_lbl:     f64,
-    _tp_lbl:     f64,
-    _sl_mae_raw: f64,
-    _tp_mfe_raw: f64,
-    // Live future bars and trade context for the cap% surrogate.
-    is_long:     bool,
-    entry_px:    f64,   // actual stop-entry trigger price
-    atr:         f64,
-    future:      &[Bar],
-    _epoch:      usize,
-) -> (f64, f64) {
-    let (pre1, h1, pre2, h2, raw) = mlp.forward_full(x);
+/// Gradient bundle returned by compute_grads — summed across threads.
+struct Grads {
+    gw1: Vec<f64>, gb1: Vec<f64>,
+    gw2: Vec<f64>, gb2: Vec<f64>,
+    gw3: Vec<f64>, gb3: Vec<f64>,
+    dir_loss: f64,
+    r_loss:   f64,
+}
+
+impl Grads {
+    fn zero(mlp: &Mlp) -> Self {
+        Self {
+            gw1: vec![0.0; mlp.w1.len()], gb1: vec![0.0; mlp.b1.len()],
+            gw2: vec![0.0; mlp.w2.len()], gb2: vec![0.0; mlp.b2.len()],
+            gw3: vec![0.0; mlp.w3.len()], gb3: vec![0.0; mlp.b3.len()],
+            dir_loss: 0.0, r_loss: 0.0,
+        }
+    }
+    fn add_assign(&mut self, other: Grads) {
+        for (a, b) in self.gw1.iter_mut().zip(other.gw1) { *a += b; }
+        for (a, b) in self.gb1.iter_mut().zip(other.gb1) { *a += b; }
+        for (a, b) in self.gw2.iter_mut().zip(other.gw2) { *a += b; }
+        for (a, b) in self.gb2.iter_mut().zip(other.gb2) { *a += b; }
+        for (a, b) in self.gw3.iter_mut().zip(other.gw3) { *a += b; }
+        for (a, b) in self.gb3.iter_mut().zip(other.gb3) { *a += b; }
+        self.dir_loss += other.dir_loss;
+        self.r_loss   += other.r_loss;
+    }
+    fn scale(&mut self, s: f64) {
+        for v in self.gw1.iter_mut() { *v *= s; }
+        for v in self.gb1.iter_mut() { *v *= s; }
+        for v in self.gw2.iter_mut() { *v *= s; }
+        for v in self.gb2.iter_mut() { *v *= s; }
+        for v in self.gw3.iter_mut() { *v *= s; }
+        for v in self.gb3.iter_mut() { *v *= s; }
+    }
+}
+
+/// Pure gradient computation for one sample — no mutation, safe to run in parallel.
+/// `seed` is used to create a local per-sample RNG for dropout; pass a unique
+/// value per (epoch, sample) combination, e.g. `epoch * 1_000_003 + sample_idx`.
+fn compute_grads(
+    mlp:      &Mlp,
+    x:        &[f64],
+    dir_lbl:  f64,
+    is_long:  bool,
+    entry_px: f64,
+    atr:      f64,
+    future:   &[Bar],
+    seed:     u64,
+) -> Grads {
+    let mut local_rng = Rng(seed.max(1));
+    let cache = mlp.forward_train(x, &mut local_rng);
+    let FwdCache { pre1, h1, mask1, pre2, h2, mask2, raw } = cache;
 
     // ── Direction output (raw[0]) — BCE loss ─────────────────────
     let dir_prob = sigmoid(raw[0]);
@@ -359,34 +492,32 @@ fn backprop_step(
     let tp_sig  = sigmoid(raw[2]);
     let tp_pred = (0.5 + tp_sig * (MAX_MULT - 0.5)).clamp(0.5, MAX_MULT);
 
-    // ── Differentiable cap% surrogate ────────────────────────────
+    // ── Differentiable R-multiple surrogate ─────────────────────
     //
-    // We want the model to directly maximise cap% = achieved_gain / max_gain.
+    // R-multiple = gain / risk = (TP distance) / (SL distance)
+    // weighted by the probability of actually achieving it.
     //
-    // simulate() is not differentiable, so we build a smooth approximation:
+    // soft_R = soft_survival * soft_tp_hit * tp_pred / sl_pred
     //
-    //   soft_survival(sl_pred):
-    //     For each future bar, compute how close the adverse excursion came to
-    //     the SL.  Use a sigmoid to get a soft "did not get stopped" probability
-    //     per bar, then multiply them (log-sum in log space for stability).
-    //     A tighter SL that price nearly touches gets a lower survival score,
-    //     pushing the gradient to widen the SL just enough.
+    //   soft_survival: product of per-bar sigmoid(k*(sl_pred - adverse_atr))
+    //     → 1 if SL never threatened, 0 if price blew through it.
+    //     Gradient pushes SL just wide enough to survive.
     //
-    //   soft_tp_hit(tp_pred):
-    //     For each future bar, compute a soft "TP was reached" signal based on
-    //     how far the MFE of that bar exceeds the predicted TP distance.
-    //     A TP just at the MFE scores ~0.5; well inside scores ~1; too far scores ~0.
+    //   soft_tp_hit: sigmoid(k*(best_fav - tp_pred))
+    //     → 1 if TP is within MFE, 0 if TP is unreachable.
+    //     Gradient pushes TP toward the MFE.
     //
-    //   soft_cap = soft_survival * soft_tp_hit
-    //   cap_loss = 1 - soft_cap   (minimise → maximise cap%)
+    //   tp_pred / sl_pred: the actual R ratio.
+    //     Wide SL hurts in the denominator; far-but-reachable TP helps.
     //
-    // Temperature k controls sharpness of the sigmoid approximations.
-    // Larger k → closer to hard sim; smaller k → smoother gradients.
+    // loss = -soft_R  (minimise → maximise R)
+    //
+    // Temperature k controls sharpness.
     let k = 8.0_f64;
 
     // Find where entry triggers so we only score bars after entry.
     let entry_bar = {
-        let mut found = future.len(); // sentinel: never triggered
+        let mut found = future.len();
         for (i, bar) in future.iter().enumerate() {
             if  is_long && bar.high >= entry_px { found = i; break; }
             if !is_long && bar.low  <= entry_px { found = i; break; }
@@ -394,34 +525,29 @@ fn backprop_step(
         found
     };
 
-    let (soft_survival, d_survival_d_sl, soft_tp, d_tp_d_tp) = if entry_bar >= future.len() {
-        // Entry never triggered — no gradient signal for SL/TP this sample.
-        (1.0_f64, 0.0_f64, 0.0_f64, 0.0_f64)
+    let (soft_r_loss, d_r_d_sl, d_r_d_tp) = if entry_bar >= future.len() {
+        // Entry never triggered — no gradient signal this sample.
+        (0.0_f64, 0.0_f64, 0.0_f64)
     } else {
-        // SL distance in price units
-        let sl_price_dist = sl_pred * atr;
-        let tp_price_dist = tp_pred * atr;
-
         let mut log_surv      = 0.0_f64;
-        let mut d_log_surv_sl = 0.0_f64; // d(log_surv)/d(sl_pred)
+        let mut d_log_surv_sl = 0.0_f64;
         let mut best_fav      = 0.0_f64;
 
         for bar in &future[entry_bar..] {
-            // Adverse excursion this bar in ATR units
             let adverse_atr = if is_long {
                 (entry_px - bar.low).max(0.0)  / atr
             } else {
                 (bar.high - entry_px).max(0.0) / atr
             };
-            // Soft survival for this bar: sigmoid( k*(sl_pred - adverse) )
-            // → 1 when SL is well above adverse, 0 when SL is below adverse.
-            let z    = k * (sl_pred - adverse_atr);
-            let s    = sigmoid(z);
+            let z = k * (sl_pred - adverse_atr);
+            let s = sigmoid(z);
             log_surv      += s.max(1e-12).ln();
-            // d(ln s)/d(sl_pred) = k*(1-s)
-            d_log_surv_sl += k * (1.0 - s);
+            // Clamp per-bar contribution to ≤ 2.0 (was k*(1-s) ≤ 8.0).
+            // Without this, a tight SL on a volatile sample accumulates a raw
+            // gradient of ~k * FORWARD ≈ 80 in the first epochs, causing the
+            // SL to slam wide in a single Adam step and never recover.
+            d_log_surv_sl += (k * (1.0 - s)).min(2.0);
 
-            // Track best favourable excursion for TP scoring
             let fav = if is_long {
                 (bar.high - entry_px).max(0.0) / atr
             } else {
@@ -430,39 +556,55 @@ fn backprop_step(
             if fav > best_fav { best_fav = fav; }
         }
 
-        let surv = log_surv.exp().clamp(1e-12, 1.0);
-        // d(surv)/d(sl_pred) = surv * d(log_surv)/d(sl_pred)
+        let surv      = log_surv.exp().clamp(1e-12, 1.0);
         let d_surv_sl = surv * d_log_surv_sl;
 
-        // Soft TP hit: sigmoid( k*(best_fav - tp_pred) )
-        // → 1 when TP is well within MFE, 0 when TP exceeds MFE.
-        let z_tp    = k * (best_fav - tp_pred);
-        let s_tp    = sigmoid(z_tp);
-        // d(s_tp)/d(tp_pred) = -k * s_tp*(1-s_tp)
-        let d_stp   = -k * s_tp * (1.0 - s_tp);
+        // Soft TP hit: sigmoid(k*(best_fav - tp_pred))
+        let z_tp  = k * (best_fav - tp_pred);
+        let s_tp  = sigmoid(z_tp);
+        let d_stp = -k * s_tp * (1.0 - s_tp); // d(s_tp)/d(tp_pred)
 
-        (surv, d_surv_sl, s_tp, d_stp)
+        // soft_R = surv * s_tp * tp_pred / sl_pred
+        let sl_safe  = sl_pred.max(1e-6);
+        let soft_r   = surv * s_tp * tp_pred / sl_safe;
+
+        // d(soft_R)/d(sl_pred):
+        //   = d(surv)/d(sl_pred) * s_tp * tp_pred / sl_safe
+        //   + surv * s_tp * tp_pred * (-1/sl_safe^2)
+        let d_r_sl = d_surv_sl * s_tp * tp_pred / sl_safe
+                   - surv * s_tp * tp_pred / (sl_safe * sl_safe);
+
+        // d(soft_R)/d(tp_pred):
+        //   = surv * d(s_tp)/d(tp_pred) * tp_pred / sl_safe
+        //   + surv * s_tp / sl_safe
+        let d_r_tp = surv * d_stp * tp_pred / sl_safe
+                   + surv * s_tp  / sl_safe;
+
+        // ── R:R floor penalty — squared hinge on tp_pred / sl_pred ──────────
+        //
+        // Fires whenever tp_pred / sl_pred < MIN_RR.
+        //
+        // penalty  = max(0, MIN_RR - tp/sl)²
+        // d/d(tp)  = -2 * hinge / sl          (negative → gradient pushes TP up)
+        // d/d(sl)  = +2 * hinge * tp / sl²    (positive → gradient pushes SL down)
+        //
+        // This directly counteracts the asymmetry where the survival term always
+        // widens SL while the TP-hit term always lowers TP, collapsing R:R < 1.
+        let rr         = tp_pred / sl_safe;
+        let hinge      = (MIN_RR - rr).max(0.0);
+        let rr_penalty = hinge * hinge;
+        let d_rr_d_tp  = -2.0 * hinge / sl_safe;
+        let d_rr_d_sl  =  2.0 * hinge * tp_pred / (sl_safe * sl_safe);
+
+        // loss = -soft_R + LAMBDA_RR * rr_penalty
+        // so d(loss)/d(*) = -d(soft_R)/d(*) + LAMBDA_RR * d(rr_penalty)/d(*)
+        (-soft_r + LAMBDA_RR * rr_penalty, -d_r_sl + LAMBDA_RR * d_rr_d_sl, -d_r_tp + LAMBDA_RR * d_rr_d_tp)
     };
 
-    // soft_cap = soft_survival * soft_tp_hit
-    // cap_loss = 1 - soft_cap  (we minimise, so this maximises cap%)
-    let soft_cap  = soft_survival * soft_tp;
-    let cap_loss  = 1.0 - soft_cap;
-
-    // d(cap_loss)/d(sl_pred):  -d(soft_cap)/d(sl_pred)
-    //   = -(d_survival_d_sl * soft_tp)
-    let d_cap_d_sl = -(d_survival_d_sl * soft_tp);
-    // d(cap_loss)/d(tp_pred):  -d(soft_cap)/d(tp_pred)
-    //   = -(soft_survival * d_tp_d_tp)
-    let d_cap_d_tp = -(soft_survival * d_tp_d_tp);
-
     // ── Output-layer gradients w.r.t. raw[*] ────────────────────
-    // Chain rule through the sigmoid-scale activation:
-    //   d(sl_pred)/d(raw[1]) = (MAX_MULT - 0.3) * sl_sig*(1-sl_sig)
-    //   d(tp_pred)/d(raw[2]) = (MAX_MULT - 0.5) * tp_sig*(1-tp_sig)
     let d_raw0 = dir_prob - dir_lbl;
-    let d_raw1 = LAMBDA_REG * d_cap_d_sl * (MAX_MULT - 0.3) * sl_sig * (1.0 - sl_sig);
-    let d_raw2 = LAMBDA_REG * d_cap_d_tp * (MAX_MULT - 0.5) * tp_sig * (1.0 - tp_sig);
+    let d_raw1 = LAMBDA_REG * d_r_d_sl * (MAX_MULT - 0.3) * sl_sig * (1.0 - sl_sig);
+    let d_raw2 = LAMBDA_REG * d_r_d_tp * (MAX_MULT - 0.5) * tp_sig * (1.0 - tp_sig);
     let d_raw  = [d_raw0, d_raw1, d_raw2];
 
     // ── w3 / b3  +  back-prop into h2 ───────────────────────────
@@ -478,7 +620,7 @@ fn backprop_step(
     }
 
     // ── w2 / b2  +  back-prop into h1 ───────────────────────────
-    let d_pre2: Vec<f64> = (0..H2).map(|i| d_h2[i] * relu_d(pre2[i])).collect();
+    let d_pre2: Vec<f64> = (0..H2).map(|i| d_h2[i] * mask2[i] * relu_d(pre2[i])).collect();
     let mut gw2 = vec![0.0f64; H2 * H1];
     let mut gb2 = vec![0.0f64; H2];
     let mut d_h1 = vec![0.0f64; H1];
@@ -491,7 +633,7 @@ fn backprop_step(
     }
 
     // ── w1 / b1 ──────────────────────────────────────────────────
-    let d_pre1: Vec<f64> = (0..H1).map(|i| d_h1[i] * relu_d(pre1[i])).collect();
+    let d_pre1: Vec<f64> = (0..H1).map(|i| d_h1[i] * mask1[i] * relu_d(pre1[i])).collect();
     let mut gw1 = vec![0.0f64; H1 * NIN];
     let mut gb1 = vec![0.0f64; H1];
     for j in 0..H1 {
@@ -501,10 +643,7 @@ fn backprop_step(
         }
     }
 
-    // ── Adam update ───────────────────────────────────────────────
-    adam.step(mlp, &gw1, &gb1, &gw2, &gb2, &gw3, &gb3);
-
-    (dir_loss, cap_loss)
+    Grads { gw1, gb1, gw2, gb2, gw3, gb3, dir_loss, r_loss: soft_r_loss }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -721,20 +860,33 @@ fn build_samples(bars: &[Bar], lookback: usize) -> Vec<Sample> {
 //  Training loop
 // ═══════════════════════════════════════════════════════════════════
 
-fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &str) {
+fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &str, confidence_threshold: f64) {
     // Always start fresh — stale weights trained on old labels will fight learning.
     match fs::remove_file(weights_path) {
         Ok(_)  => println!("Deleted old weights: {}", weights_path),
         Err(_) => println!("No existing weights to delete."),
     }
 
+    // ── Final-year holdout split (bar level) ──────────────────────────────────
+    // The last 20% of bars are reserved as a true out-of-sample holdout.
+    // They are carved out HERE, before any sample building, so the model
+    // never sees these bars during training — not even in the lookback window
+    // of a training sample.  The holdout slice includes `lookback` bars of
+    // overlap so that its own samples have valid indicator context.
+    // Weight saving is never triggered by holdout performance.
+    let split_bar    = (bars.len() as f64 * 0.80) as usize;
+    let train_bars   = &bars[..split_bar];
+    let holdout_bars = &bars[split_bar.saturating_sub(lookback)..]; // context overlap
+
     println!(
-        "Building samples  (5-min bars={}, lookback={}, forward={})...",
-        bars.len(),
+        "Building samples  (train bars={}, holdout bars={}, lookback={}, forward={})...",
+        train_bars.len(),
+        holdout_bars.len().saturating_sub(lookback),
         lookback,
         FORWARD
     );
-    let samples = build_samples(bars, lookback);
+
+    let samples = build_samples(train_bars, lookback);
     if samples.is_empty() {
         eprintln!(
             "Not enough 5-min bars to build any sample. \
@@ -744,6 +896,10 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
         );
         process::exit(1);
     }
+
+    // Build holdout samples from the reserved bars.  These are never shuffled,
+    // balanced, or passed to the optimiser — inference only.
+    let holdout_samples = build_samples(holdout_bars, lookback);
 
     // Chronological 80/20 split — boundary is fixed to prevent future-leakage.
     // Validation stays as-is (chronological, unbalanced — reflects real distribution).
@@ -777,9 +933,10 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
     let n_long  = long_indices.len();
     let n_short = short_indices.len();
     println!(
-        "  {} training samples  |  {} validation samples",
+        "  {} training samples  |  {} validation samples  |  {} holdout samples (final year, never trained)",
         balanced_idx.len(),
-        val_set.len()
+        val_set.len(),
+        holdout_samples.len()
     );
     println!("  Train balance: {n_long} Long / {n_short} Short (balanced)");
 
@@ -793,29 +950,84 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
     let mut idx: Vec<usize> = balanced_idx;
 
     // ── Two-row column header ─────────────────────────────────────────────────────────────────────
-    println!("\n{:<6}  {:<20}  {:<12}  {:<12}  {:<10}  {:<8}  {:<8}  {:<8}  {:<8}  {:<8}  {}",
-        "Epoch", "loss", "trn_dir%", "val_dir%", "pnl%", "win%", "pf", "sl_mae", "tp_mae", "cap%", "sec");
-    println!("{}", "─".repeat(115));
+    println!("\n{:<6}  {:<20}  {:<12}  {:<12}  {:<10}  {:<10}  {:<8}  {:<8}  {:<8}  {:<8}  {:<8}  {}",
+        "Epoch", "loss", "trn_dir%", "val_dir%", "ent%", "pnl%", "win%", "pf", "sl_mae", "tp_mae", "cap%", "sec");
+    println!("{}", "─".repeat(130));
+
+    // ── Early-stopping state ──────────────────────────────────────────────
+    // We track the best validation PNL seen so far and save weights whenever
+    // it improves.  If it hasn't improved for PATIENCE reporting intervals
+    // (each interval = 5 epochs), training stops and the best checkpoint is
+    // restored automatically (it was already saved to disk).
+    let mut best_val_pnl:    f64   = f64::NEG_INFINITY;
+    let mut patience_counter: usize = 0;
+
+    // ── Entry-rate (ent%) rise detection ─────────────────────────────────
+    // While ent is falling the model is getting more selective — good.
+    // Once ent starts climbing back up the model is losing conviction and
+    // overfitting.  We stop after 2 consecutive reporting intervals where
+    // ent is higher than the previous interval, but only once ent has
+    // actually reached a low (< 1 %) so we don't fire during the initial
+    // high-ent warm-up phase.
+    let mut min_ent_seen:    f64   = f64::INFINITY;
+    let mut prev_ent:        f64   = f64::INFINITY;
+    let mut ent_rise_streak: usize = 0;
 
     for epoch in 0..epochs {
         let t_ep = Instant::now();
         rng.shuffle(&mut idx);
 
+        // ── Mini-batch SGD: one Adam step per BATCH_SIZE samples ────
+        // The shuffled idx is sliced into mini-batches of BATCH_SIZE.
+        // Within each mini-batch, Rayon splits work across N_THREADS so
+        // every core stays saturated (≈ BATCH_SIZE / N_THREADS samples
+        // per thread ≈ 228 at 4096 / 18).
+        const N_THREADS: usize = 18;
+
         let (mut sum_dir, mut sum_off) = (0.0_f64, 0.0_f64);
-        for &k in &idx {
-            let s = &train_set[k];
-            let is_long   = s.dir_label >= 0.5;
-            let entry_px  = if is_long { s.close + 0.25 * s.atr } else { s.close - 0.25 * s.atr };
-            let (dl, ol) = backprop_step(
-                &mut mlp, &mut adam,
-                &s.features,
-                s.dir_label, s.sl_mult, s.tp_mult,
-                s.sl_mae_raw, s.tp_mfe_raw,
-                is_long, entry_px, s.atr, &s.future,
-                epoch,
+        for batch in idx.chunks(BATCH_SIZE) {
+            let chunk_size = (batch.len() + N_THREADS - 1) / N_THREADS;
+
+            let (bd, bo, acc_grads) = batch
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut local = Grads::zero(&mlp);
+                    for &k in chunk {
+                        let s        = &train_set[k];
+                        let is_long  = s.dir_label >= 0.5;
+                        let entry_px = if is_long { s.close + 0.25 * s.atr }
+                                       else       { s.close - 0.25 * s.atr };
+                        // Unique seed per (epoch, sample) for reproducible-ish dropout.
+                        let seed = (epoch as u64).wrapping_mul(1_000_003)
+                                                 .wrapping_add(k as u64);
+                        let g = compute_grads(
+                            &mlp, &s.features,
+                            s.dir_label, is_long, entry_px, s.atr, &s.future,
+                            seed,
+                        );
+                        local.add_assign(g);
+                    }
+                    (local.dir_loss, local.r_loss, local)
+                })
+                .reduce(
+                    || (0.0_f64, 0.0_f64, Grads::zero(&mlp)),
+                    |(da, oa, mut ga), (db, ob, gb)| {
+                        ga.add_assign(gb);
+                        (da + db, oa + ob, ga)
+                    },
+                );
+
+            // Average gradients over this mini-batch then apply one Adam step.
+            let mut acc_grads = acc_grads;
+            let inv_n = 1.0 / batch.len() as f64;
+            acc_grads.scale(inv_n);
+            adam.step(&mut mlp,
+                &acc_grads.gw1, &acc_grads.gb1,
+                &acc_grads.gw2, &acc_grads.gb2,
+                &acc_grads.gw3, &acc_grads.gb3,
             );
-            sum_dir += dl;
-            sum_off += ol;
+            sum_dir += bd;
+            sum_off += bo;
         }
         let n      = idx.len() as f64;
         let ep_sec = t_ep.elapsed().as_secs_f64();
@@ -852,10 +1064,14 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
 
             let mut capture_ratios: Vec<f64> = Vec::new();
 
+            let mut n_conf_passed = 0usize;
             for s in val_set.iter() {
                 let (dir_prob, sm, tm) = mlp.predict(&s.features);
+                // Skip low-confidence signals — only trade when the model is
+                // sufficiently decisive (|dir_prob - 0.5| >= confidence_threshold).
+                if (dir_prob - 0.5).abs() < confidence_threshold { continue; }
+                n_conf_passed += 1;
                 let is_long = dir_prob >= 0.5;
-                // SL and TP are distances from close in ATR units
                 let (sl, tp) = if is_long {
                     (s.close - sm * s.atr, s.close + tm * s.atr)
                 } else {
@@ -929,50 +1145,121 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
                               else { format!("{:>5.2}", profit_factor) };
             let capture_str = if avg_capture.is_nan()  { format!("{:>6}", "n/a") }
                               else { format!("{:>5.1}%", avg_capture) };
+            let pct_entered = n_conf_passed as f64 / nv * 100.0;
 
             // average per-sample loss
             let total_loss = (sum_dir + sum_off) / n;
 
-            // ── Best trade sample this epoch ───────────────────────
-            struct BestInfo { entry: f64, sl: f64, tp: f64, won: bool, pnl: f64, is_long: bool }
-            let mut best_pnl  = f64::NEG_INFINITY;
-            let mut best_info: Option<BestInfo> = None;
-            for s in val_set.iter() {
-                let (dir_prob, sm, tm) = mlp.predict(&s.features);
-                let is_long = dir_prob >= 0.5;
-                let (sl, tp) = if is_long {
-                    (s.close - sm * s.atr, s.close + tm * s.atr)
-                } else {
-                    (s.close + sm * s.atr, s.close - tm * s.atr)
-                };
-                let entry_h = s.close + 0.25 * s.atr;
-                let entry_l = s.close - 0.25 * s.atr;
-                let entry   = if is_long { entry_h } else { entry_l };
-                if let Some(t) = simulate(is_long, entry_h, entry_l, sl, tp, &s.future) {
-                    if t.pct_gain > best_pnl {
-                        best_pnl = t.pct_gain;
-                        best_info = Some(BestInfo { entry, sl, tp, won: t.won, pnl: t.pct_gain, is_long });
+            // ── Final-year holdout report ─────────────────────────────────────
+            let holdout_str = if !holdout_samples.is_empty() {
+                let mut fy_pnls: Vec<f64> = Vec::new();
+                let mut fy_wins = 0usize;
+                let mut fy_losses = 0usize;
+                let mut fy_skipped = 0usize;
+
+                for s in holdout_samples.iter() {
+                    let (dir_prob, sm, tm) = mlp.predict(&s.features);
+                    if (dir_prob - 0.5).abs() < confidence_threshold {
+                        fy_skipped += 1;
+                        continue;
+                    }
+                    let is_long = dir_prob >= 0.5;
+                    let (sl, tp) = if is_long {
+                        (s.close - sm * s.atr, s.close + tm * s.atr)
+                    } else {
+                        (s.close + sm * s.atr, s.close - tm * s.atr)
+                    };
+                    let entry_high = s.close + 0.25 * s.atr;
+                    let entry_low  = s.close - 0.25 * s.atr;
+                    if let Some(t) = simulate(is_long, entry_high, entry_low, sl, tp, &s.future) {
+                        fy_pnls.push(t.pct_gain);
+                        if t.won { fy_wins += 1; } else { fy_losses += 1; }
                     }
                 }
-            }
-            let best_str = best_info.map(|b| format!(
-                "  |  {} entry={:.4} sl={:.4} tp={:.4} {} ({:+.3}%)",
-                if b.is_long { "LONG " } else { "SHORT" },
-                b.entry, b.sl, b.tp,
-                if b.won { "WIN ✓" } else { "LOSS ✗" },
-                b.pnl
-            )).unwrap_or_default();
+
+                let fy_n        = (fy_wins + fy_losses) as f64;
+                let fy_avg_pnl  = if fy_pnls.is_empty() { f64::NAN }
+                                  else { fy_pnls.iter().sum::<f64>() / fy_pnls.len() as f64 };
+                let fy_win_rate = if fy_n > 0.0 { fy_wins as f64 / fy_n * 100.0 } else { f64::NAN };
+                let fy_pf = {
+                    let gw = fy_pnls.iter().filter(|&&p| p > 0.0).sum::<f64>();
+                    let gl = fy_pnls.iter().filter(|&&p| p < 0.0).map(|p| p.abs()).sum::<f64>();
+                    if gl < 1e-9 { f64::NAN } else { gw / gl }
+                };
+                format!(
+                    "  | ho: pnl={:>+6.3}%  win={:>5.1}%  pf={:>5.2}  tr={}/sk={}",
+                    if fy_avg_pnl.is_nan() { 0.0 } else { fy_avg_pnl },
+                    if fy_win_rate.is_nan() { 0.0 } else { fy_win_rate },
+                    if fy_pf.is_nan() { 0.0 } else { fy_pf },
+                    fy_wins + fy_losses,
+                    fy_skipped,
+                )
+            } else {
+                String::new()
+            };
 
             println!(
-                "ep={:<5}  loss={:.4}  trn={:>5.1}%  val={:>5.1}%  pnl={}  win={}  pf={}  sl={:.3}  tp={:.3}  cap={}  {:.2}s{}",
-                epoch+1, total_loss, train_dir, val_dir,
+                "ep={:<5}  loss={:.4}  trn={:>5.1}%  val={:>5.1}%  ent={:>6.2}%  pnl={}  win={}  pf={}  sl={:.3}  tp={:.3}  cap={}  {:.2}s{}",
+                epoch+1, total_loss, train_dir, val_dir, pct_entered,
                 pnl_str, win_str, pf_str, sl_mae, tp_mae, capture_str, ep_sec,
-                best_str
+                holdout_str
             );
+
+            // ── Entry-rate rise detection ─────────────────────────────────
+            // Update the running minimum and consecutive-rise counter.
+            if pct_entered < min_ent_seen {
+                // New low — model is still getting more selective.
+                min_ent_seen    = pct_entered;
+                ent_rise_streak = 0;
+            } else if pct_entered > prev_ent {
+                // Higher than last interval — model is losing conviction.
+                ent_rise_streak += 1;
+            } else {
+                // Flat or down — streak broken.
+                ent_rise_streak = 0;
+            }
+            prev_ent = pct_entered;
+
+            // Fire only after ent has actually bottomed out (< 1 %) AND has
+            // now risen for 2 consecutive reporting intervals.
+          //  if ent_rise_streak >= 2 && min_ent_seen < 1.0 {
+               // println!(
+            //        "\nEarly stopping: ent% rising for {} consecutive intervals \
+              //       (now {:.2}%, min was {:.2}%). Best val PNL: {:+.4}%",
+               //     ent_rise_streak, pct_entered, min_ent_seen, best_val_pnl
+            //    );
+              //  println!("Best weights already saved → {}", weights_path);
+             //   return;
+          //  }
+
+            // ── Early stopping check ──────────────────────────────────────
+            if !avg_pnl.is_nan() && avg_pnl > best_val_pnl {
+                best_val_pnl     = avg_pnl;
+                patience_counter = 0;
+                // Save the best checkpoint immediately so we keep it on break.
+                mlp.save(weights_path);
+            } else {
+                patience_counter += 1;
+                if patience_counter >= PATIENCE {
+                    println!(
+                        "\nEarly stopping: val PNL has not improved for {} reporting \
+                         intervals ({} epochs). Best val PNL: {:+.4}%",
+                        PATIENCE, PATIENCE * 5, best_val_pnl
+                    );
+                    println!("Best weights already saved → {}", weights_path);
+                    return;
+                }
+            }
         }
     }
 
-    mlp.save(weights_path);
+    // If we finished all epochs without early-stopping, only save if we haven't
+    // already saved a better checkpoint (best_val_pnl guard).
+    if best_val_pnl == f64::NEG_INFINITY {
+        mlp.save(weights_path);
+    } else {
+        println!("Training complete. Best val PNL: {:+.4}%  weights → {}", best_val_pnl, weights_path);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1052,7 +1339,7 @@ fn simulate(
     None // position still open at end of window — excluded from stats
 }
 
-fn evaluate(bars: &[Bar], lookback: usize, mlp: &Mlp) {
+fn evaluate(bars: &[Bar], lookback: usize, mlp: &Mlp, confidence_threshold: f64) {
     // Use the latter half of the data as the out-of-sample eval set
     // to avoid overlap with anything that was in the training split.
     let eval_bars = if bars.len() > (lookback + FORWARD) * 4 {
@@ -1076,6 +1363,11 @@ fn evaluate(bars: &[Bar], lookback: usize, mlp: &Mlp) {
 
         let features = compute_indicators(window);
         let (dir_prob, sm, tm) = mlp.predict(&features);
+        // Skip low-confidence signals — same threshold as training eval.
+        if (dir_prob - 0.5).abs() < confidence_threshold {
+            no_entry += 1; // count as "no trade taken" for reporting
+            continue;
+        }
         let is_long = dir_prob >= 0.5;
         let cur     = &eval_bars[i - 1];
         let atr     = current_atr(window, 14).max(1e-8);
@@ -1129,7 +1421,7 @@ fn evaluate(bars: &[Bar], lookback: usize, mlp: &Mlp) {
     println!("║  Back-Test Results                               ║");
     println!("╠══════════════════════════════════════════════════╣");
     println!("║  Positions simulated  : {:>6}                   ║", n);
-    println!("║  Entry never triggered: {:>6}  (excluded)       ║", no_entry);
+    println!("║  Skipped / no entry   : {:>6}  (excluded)       ║", no_entry);
     println!("║  Win rate             : {:>6.1}%                ║", win_rate);
     println!("║  Avg hold (candles)   : {:>6.1}                 ║", avg_hold);
     println!("║  Avg hold (minutes)   : {:>6.1}                 ║", avg_hold * 5.0);
@@ -1151,7 +1443,7 @@ fn evaluate(bars: &[Bar], lookback: usize, mlp: &Mlp) {
 //  Live prediction (latest window)
 // ═══════════════════════════════════════════════════════════════════
 
-fn predict_latest(bars: &[Bar], lookback: usize, mlp: &Mlp) {
+fn predict_latest(bars: &[Bar], lookback: usize, mlp: &Mlp, confidence_threshold: f64) {
     if bars.len() < lookback {
         eprintln!(
             "Error: only {} 5-min bars available; need at least {} for lookback.",
@@ -1179,7 +1471,9 @@ fn predict_latest(bars: &[Bar], lookback: usize, mlp: &Mlp) {
     };
 
     // Confidence: how far the direction probability is from the 0.5 threshold
-    let confidence = (dir_prob - 0.5).abs() * 200.0; // mapped to [0, 100]
+    let confidence = (dir_prob - 0.5).abs();
+    let confidence_pct = confidence * 200.0; // mapped to [0, 100]
+    let below_threshold = confidence < confidence_threshold;
 
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -1187,8 +1481,12 @@ fn predict_latest(bars: &[Bar], lookback: usize, mlp: &Mlp) {
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Direction    : {:<10}  ({:.1}% confident)          ║",
         if is_long { "LONG  ▲" } else { "SHORT ▼" },
-        confidence
+        confidence_pct
     );
+    if below_threshold {
+        println!("║  ⚠ LOW CONFIDENCE — below {:.0}% threshold, skip trade  ║",
+            confidence_threshold * 200.0);
+    }
     println!("║  Close price  : {:<12.4}                              ║", cur.close);
     println!("║  ATR (14-bar) : {:<12.4}                              ║", atr);
     println!("╠══════════════════════════════════════════════════════════╣");
@@ -1220,9 +1518,18 @@ fn usage(prog: &str) {
     eprintln!("  --weights  Path to the JSON weights file (save / load).");
     eprintln!("  --epochs   Training epochs (default 100).");
     eprintln!("  --lr       Adam learning rate (default 0.001).");
+    eprintln!("  --confidence  Min |dir_prob - 0.5| to enter a trade (default {CONFIDENCE_THRESHOLD:.2}). Range [0, 0.5).");
 }
 
 fn main() {
+    // Pin Rayon's global thread pool to 18 threads.
+    // 18 / 24 logical threads on the Ryzen 9 5900X ≈ 75% CPU utilisation.
+    // Adjust this value if you want more or less headroom for other processes.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(18)
+        .build_global()
+        .expect("Failed to build Rayon thread pool");
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         usage(&args[0]);
@@ -1239,6 +1546,7 @@ fn main() {
     let mut start_date   = String::new();
     let mut end_date     = String::new();
     let mut api_key      = String::new();
+    let mut confidence_threshold = CONFIDENCE_THRESHOLD;
 
     let mut i = 2;
     while i < args.len() {
@@ -1251,6 +1559,7 @@ fn main() {
             "--start-date" => { i += 1; start_date   = args[i].clone(); }
             "--end-date"   => { i += 1; end_date     = args[i].clone(); }
             "--api-key"    => { i += 1; api_key      = args[i].clone(); }
+            "--confidence" => { i += 1; confidence_threshold = args[i].parse().expect("--confidence: float [0, 0.5)"); }
             other          => eprintln!("Unknown flag '{}' — ignored", other),
         }
         i += 1;
@@ -1298,18 +1607,18 @@ fn main() {
                 epochs, lr, lookback, weights_path
             );
             println!();
-            train(&bars_5min, lookback, epochs, lr, &weights_path);
+            train(&bars_5min, lookback, epochs, lr, &weights_path, confidence_threshold);
         }
         "eval" => {
             println!("Mode: EVAL    weights={}", weights_path);
             println!();
             let mlp = Mlp::load(&weights_path);
-            evaluate(&bars_5min, lookback, &mlp);
+            evaluate(&bars_5min, lookback, &mlp, confidence_threshold);
         }
         "predict" => {
             println!("Mode: PREDICT  weights={}", weights_path);
             let mlp = Mlp::load(&weights_path);
-            predict_latest(&bars_5min, lookback, &mlp);
+            predict_latest(&bars_5min, lookback, &mlp, confidence_threshold);
         }
         _ => {
             eprintln!("Unknown mode '{}'. Must be: train | eval | predict", mode);

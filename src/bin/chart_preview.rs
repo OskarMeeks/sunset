@@ -306,16 +306,27 @@ fn sync_data(symbol: &str, csv_path: &str, start: &str, end: &str, api_keys: &[S
 //  Chart generation
 // ═══════════════════════════════════════════════════════════════════
 
-/// Returns `true` if the signal passed the confidence threshold and a chart
-/// was written; `false` if the bar was skipped due to low confidence.
+/// Data returned by run_chart for each bar that passed the confidence gate.
+struct TradePoint {
+    date:       chrono::NaiveDate,
+    confidence: f64,   // 0–100 %
+    pct_gain:   f64,   // signed %
+    is_long:    bool,
+    won:        bool,
+    open_trade: bool,  // true when neither SL nor TP was hit
+}
+
+/// Returns `Some(TradePoint)` if the signal passed the confidence threshold
+/// and a chart was written; `None` if the bar was skipped.
 fn run_chart(
     bars:                 &[Bar],
     lookback:             usize,
     mlp:                  &Mlp,
     bar_index:            Option<usize>,
+    bar_date:             chrono::NaiveDate,
     out_path:             &str,
     confidence_threshold: f64,
-) -> bool {
+) -> Option<TradePoint> {
     if bars.len() < lookback + FORWARD * 2 + 1 {
         eprintln!(
             "Error: only {} 5-min bars — need at least {} for lookback {} + forward window.",
@@ -344,7 +355,7 @@ fn run_chart(
     // Skip this bar if the model is not confident enough.
     let raw_confidence = (dir_prob - 0.5).abs();
     if raw_confidence < confidence_threshold {
-        return false;
+        return None;
     }
 
     let is_long            = dir_prob >= 0.5;
@@ -579,12 +590,287 @@ fn run_chart(
     println!("  Open {} in any browser.", out_path);
     println!();
 
-    true
+    Some(TradePoint {
+        date:       bar_date,
+        confidence,
+        pct_gain,
+        is_long,
+        won:        trade.as_ref().map_or(false, |t| t.won),
+        open_trade: trade.is_none(),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Entry point
+//  score_bar — like run_chart but no file, no confidence gate
 // ═══════════════════════════════════════════════════════════════════
+
+fn score_bar(
+    bars:     &[Bar],
+    lookback: usize,
+    mlp:      &Mlp,
+    idx:      usize,
+    date:     chrono::NaiveDate,
+) -> Option<TradePoint> {
+    let max_i = bars.len().saturating_sub(FORWARD * 2);
+    if idx < lookback || idx >= max_i { return None; }
+
+    let window = &bars[idx - lookback..idx];
+    if window.len() < 27 { return None; }
+
+    let features           = compute_indicators(window);
+    let (dir_prob, sm, tm) = mlp.predict(&features);
+
+    let is_long  = dir_prob >= 0.5;
+    let cur      = &bars[idx - 1];
+    let atr      = current_atr(window, 14).max(1e-8);
+    let confidence = (dir_prob - 0.5).abs() * 200.0;
+
+    let (sl, tp) = if is_long {
+        (cur.close - sm * atr, cur.close + tm * atr)
+    } else {
+        (cur.close + sm * atr, cur.close - tm * atr)
+    };
+    let entry_high = cur.close + 0.25 * atr;
+    let entry_low  = cur.close - 0.25 * atr;
+
+    let future_len = (FORWARD * 2).min(bars.len() - idx);
+    let future     = &bars[idx..idx + future_len];
+    let trade      = simulate(is_long, entry_high, entry_low, sl, tp, future);
+
+    let pct_gain = trade.as_ref().map_or(0.0, |t| t.pct_gain);
+
+    Some(TradePoint {
+        date,
+        confidence,
+        pct_gain,
+        is_long,
+        won:        trade.as_ref().map_or(false, |t| t.won),
+        open_trade: trade.is_none(),
+    })
+}
+
+
+fn write_scatter(points: &[TradePoint], out_path: &str) {
+    // `points` already contains exactly one entry per calendar day (guaranteed by
+    // the caller), sorted chronologically. Emit them directly as JS.
+    let mut pts_js = String::from("[\n");
+    for p in points {
+        let color = if p.open_trade { "#b0b0b0" }
+                    else if p.won   { "#26a69a" }
+                    else            { "#ef5350" };
+        let dir = if p.is_long { "LONG" } else { "SHORT" };
+        pts_js.push_str(&format!(
+            "  {{date:\"{date}\",x:{conf:.2},y:{pnl:.4},color:\"{color}\",dir:\"{dir}\",open:{open}}},\n",
+            date  = p.date,
+            conf  = p.confidence,
+            pnl   = p.pct_gain,
+            color = color,
+            dir   = dir,
+            open  = p.open_trade,
+        ));
+    }
+    pts_js.push(']');
+
+    let html = format!(r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stop-Entry AI — Daily Confidence vs P&L</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#131722;color:#d1d4dc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh}}
+  #header{{display:flex;align-items:center;gap:16px;padding:10px 18px;background:#1e2130;border-bottom:1px solid #2a2e39;flex-shrink:0}}
+  #header h1{{font-size:14px;font-weight:600;color:#fff;letter-spacing:.04em}}
+  #summary{{display:flex;gap:20px;padding:6px 18px;background:#1a1e2e;border-bottom:1px solid #2a2e39;font-size:11px;flex-shrink:0;align-items:center;flex-wrap:wrap}}
+  .sl{{color:#787b86;margin-right:4px}} .sv{{color:#d1d4dc;font-weight:600}} .dv{{color:#2a2e39}}
+  #wrap{{flex:1;position:relative;padding:24px 24px 10px}}
+  canvas{{display:block}}
+  #tooltip{{position:fixed;pointer-events:none;background:rgba(19,23,34,.95);border:1px solid #2a2e39;border-radius:6px;padding:8px 12px;font-size:12px;line-height:1.9;display:none;z-index:99}}
+  .legend{{display:flex;gap:16px;align-items:center;font-size:11px;margin-top:8px}}
+  .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px;vertical-align:middle}}
+</style>
+</head>
+<body>
+<div id="header"><h1>Stop-Entry AI — First Trade per Day: Confidence vs P&amp;L</h1></div>
+<div id="summary">
+  <span><span class="sl">Trading days</span><span class="sv" id="s-days">—</span></span>
+  <span class="dv">|</span>
+  <span><span class="sl">Wins</span><span class="sv" id="s-green">—</span></span>
+  <span class="dv">|</span>
+  <span><span class="sl">Total P&amp;L</span><span class="sv" id="s-pnl">—</span></span>
+  <span class="dv">|</span>
+  <span><span class="sl">Avg daily P&amp;L</span><span class="sv" id="s-avg">—</span></span>
+  <span class="dv">|</span>
+  <span><span class="sl">Avg confidence</span><span class="sv" id="s-conf">—</span></span>
+</div>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div class="legend">
+    <span><span class="dot" style="background:#26a69a"></span>Net profitable day</span>
+    <span><span class="dot" style="background:#ef5350"></span>Net losing day</span>
+    <span><span class="dot" style="background:#b0b0b0"></span>Flat / open only</span>
+  </div>
+</div>
+<div id="tooltip"></div>
+<script>
+(function(){{
+  const DATA = {pts_js};
+
+  // ── Summary ────────────────────────────────────────────────────
+  const closed = DATA.filter(d => !d.open);
+  const wins   = closed.filter(d => d.color === "#26a69a");
+  const totalPnl = closed.reduce((s,d)=>s+d.y, 0);
+  const avgPnl   = closed.length ? totalPnl / closed.length : 0;
+  const avgConf  = DATA.length ? DATA.reduce((s,d)=>s+d.x,0)/DATA.length : 0;
+
+  document.getElementById("s-days").textContent  = DATA.length;
+  document.getElementById("s-green").textContent = wins.length + " / " + closed.length;
+  document.getElementById("s-pnl").textContent   = (totalPnl >= 0 ? "+" : "") + totalPnl.toFixed(3) + "%";
+  document.getElementById("s-avg").textContent   = (avgPnl   >= 0 ? "+" : "") + avgPnl.toFixed(3)   + "%";
+  document.getElementById("s-conf").textContent  = avgConf.toFixed(1) + "%";
+
+  // ── Canvas ─────────────────────────────────────────────────────
+  const wrap   = document.getElementById("wrap");
+  const canvas = document.getElementById("c");
+  const tip    = document.getElementById("tooltip");
+  const PAD    = {{l:68,r:30,t:30,b:50}};
+
+  function mapRange(v, inLo, inHi, outLo, outHi) {{
+    if (inHi === inLo) return (outLo + outHi) / 2;
+    return outLo + (v - inLo) / (inHi - inLo) * (outHi - outLo);
+  }}
+
+  function computeBounds() {{
+    const xs = DATA.map(d=>d.x), ys = DATA.map(d=>d.y);
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    const xPad = (xMax - xMin) * 0.08 || 1;
+    const yAbs = Math.max(Math.abs(yMin), Math.abs(yMax));
+    const yPad = yAbs * 0.15 || 0.1;
+    return {{
+      xLo: xMin - xPad, xHi: xMax + xPad,
+      yLo: -(yAbs + yPad), yHi: yAbs + yPad,
+    }};
+  }}
+
+  function draw() {{
+    const W = canvas.width, H = canvas.height;
+    const pw = W - PAD.l - PAD.r, ph = H - PAD.t - PAD.b;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, W, H);
+    if (!DATA.length) return;
+
+    const {{xLo, xHi, yLo, yHi}} = computeBounds();
+    const cx = v => mapRange(v, xLo, xHi, PAD.l, PAD.l + pw);
+    const cy = v => mapRange(v, yLo, yHi, PAD.t + ph, PAD.t);
+
+    // Grid lines
+    const GRID = 5;
+    ctx.lineWidth = 1;
+    for (let g = 0; g <= GRID; g++) {{
+      ctx.strokeStyle = "#1e2130";
+      const yv = yLo + (yHi - yLo) * g / GRID;
+      ctx.beginPath(); ctx.moveTo(PAD.l, cy(yv)); ctx.lineTo(PAD.l + pw, cy(yv)); ctx.stroke();
+      const xv = xLo + (xHi - xLo) * g / GRID;
+      ctx.beginPath(); ctx.moveTo(cx(xv), PAD.t); ctx.lineTo(cx(xv), PAD.t + ph); ctx.stroke();
+    }}
+
+    // Zero line
+    ctx.strokeStyle = "#3a3e50"; ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath(); ctx.moveTo(PAD.l, cy(0)); ctx.lineTo(PAD.l + pw, cy(0)); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Axis border
+    ctx.strokeStyle = "#2a2e39"; ctx.lineWidth = 1;
+    ctx.strokeRect(PAD.l, PAD.t, pw, ph);
+
+    // Y labels
+    ctx.fillStyle = "#787b86"; ctx.font = "11px sans-serif"; ctx.textAlign = "right";
+    for (let g = 0; g <= GRID; g++) {{
+      const yv = yLo + (yHi - yLo) * g / GRID;
+      ctx.fillText(yv.toFixed(2) + "%", PAD.l - 6, cy(yv) + 4);
+    }}
+
+    // X labels
+    ctx.textAlign = "center";
+    for (let g = 0; g <= GRID; g++) {{
+      const xv = xLo + (xHi - xLo) * g / GRID;
+      ctx.fillText(xv.toFixed(1) + "%", cx(xv), PAD.t + ph + 18);
+    }}
+
+    // Axis titles
+    ctx.fillStyle = "#787b86"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("Avg Confidence", PAD.l + pw / 2, PAD.t + ph + 38);
+    ctx.save();
+    ctx.translate(14, PAD.t + ph / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText("Net Daily P&L %", 0, 0);
+    ctx.restore();
+
+    // Points
+    DATA.forEach(p => {{
+      const px = cx(p.x), py = cy(p.y);
+      ctx.beginPath(); ctx.arc(px, py, 7, 0, Math.PI*2);
+      ctx.fillStyle   = p.color + "88";
+      ctx.fill();
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth   = 2;
+      ctx.stroke();
+    }});
+  }}
+
+  // ── Tooltip ────────────────────────────────────────────────────
+  function nearestPoint(mx, my) {{
+    const W = canvas.width, H = canvas.height;
+    const pw = W - PAD.l - PAD.r, ph = H - PAD.t - PAD.b;
+    const {{xLo, xHi, yLo, yHi}} = computeBounds();
+    const cx = v => mapRange(v, xLo, xHi, PAD.l, PAD.l + pw);
+    const cy = v => mapRange(v, yLo, yHi, PAD.t + ph, PAD.t);
+    let best = null, bestD = 22;
+    DATA.forEach(p => {{
+      const d = Math.hypot(cx(p.x) - mx, cy(p.y) - my);
+      if (d < bestD) {{ bestD = d; best = p; }}
+    }});
+    return best;
+  }}
+
+  canvas.addEventListener("mousemove", e => {{
+    const rect = canvas.getBoundingClientRect();
+    const p = nearestPoint(e.clientX - rect.left, e.clientY - rect.top);
+    if (p) {{
+      const result = p.open ? "Open" : (p.color === "#26a69a" ? "Win ✓" : "Loss ✗");
+      tip.innerHTML =
+        `<b style="color:${{p.color}}">${{p.date}} — ${{p.dir}}</b><br>` +
+        `Confidence: <b>${{p.x.toFixed(1)}}%</b><br>` +
+        `P&amp;L: <b style="color:${{p.color}}">${{p.y >= 0 ? "+" : ""}}${{p.y.toFixed(3)}}%</b><br>` +
+        `Result: <b>${{result}}</b>`;
+      tip.style.display = "block";
+      tip.style.left = (e.clientX + 16) + "px";
+      tip.style.top  = (e.clientY - 10) + "px";
+    }} else {{
+      tip.style.display = "none";
+    }}
+  }});
+  canvas.addEventListener("mouseleave", () => tip.style.display = "none");
+
+  function resize() {{
+    canvas.width  = wrap.clientWidth;
+    canvas.height = wrap.clientHeight - 36;
+    draw();
+  }}
+  window.addEventListener("resize", resize);
+  resize();
+}})();
+</script>
+</body>
+</html>
+"##, pts_js = pts_js);
+
+    fs::write(out_path, &html)
+        .unwrap_or_else(|e| panic!("Cannot write scatter '{}': {}", out_path, e));
+}
+
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -736,11 +1022,12 @@ fn main() {
     // When --bar-index is given we run exactly that one bar (existing behaviour).
 
     if let Some(idx) = bar_index {
-        // Explicit index — single chart, no confidence gate bypass (gate still
-        // applies so the output is consistent with scan mode).
+        // Explicit index — single chart.
         let out_path = chart_out.clone();
-        let taken = run_chart(&bars, lookback, &mlp, Some(idx), &out_path, confidence_threshold);
-        if !taken {
+        let date = bar_dates.get(idx).copied()
+            .unwrap_or_else(|| chrono::Local::now().date_naive());
+        let result = run_chart(&bars, lookback, &mlp, Some(idx), date, &out_path, confidence_threshold);
+        if result.is_none() {
             let conf_pct = confidence_threshold * 200.0;
             println!("Bar {} skipped — confidence below {:.0}% threshold.", idx, conf_pct);
         }
@@ -760,6 +1047,11 @@ fn main() {
         let cap        = if samples == 0 { usize::MAX } else { samples };
         let mut chart_n    = 0usize;
         let mut skipped    = 0usize;
+        let mut trade_points: Vec<TradePoint> = Vec::new();
+
+        // Keep an uncapped copy for the scatter — we want every day in the range,
+        // not just the first `samples` that passed the confidence gate.
+        let scan_indices_for_scatter = scan_indices.clone();
 
         println!(
             "Scanning {} bars for signals with confidence ≥ {:.0}% (cap: {}) …",
@@ -778,17 +1070,44 @@ fn main() {
                 format!("{}_{}.html", stem, chart_n)
             };
 
-            let taken = run_chart(&bars, lookback, &mlp, Some(idx), &out_path, confidence_threshold);
-            if taken {
-                // chart_n already incremented; message printed inside run_chart.
-            } else {
-                // Undo the counter increment — this bar didn't produce a chart.
-                chart_n -= 1;
-                skipped += 1;
+            match run_chart(&bars, lookback, &mlp, Some(idx), bar_dates[idx], &out_path, confidence_threshold) {
+                Some(tp) => {
+                    trade_points.push(tp);
+                }
+                None => {
+                    chart_n -= 1;
+                    skipped += 1;
+                }
             }
         }
 
         println!();
         println!("Scan complete — {} chart(s) written, {} bar(s) skipped (low confidence).", chart_n, skipped);
+
+        // ── Scatter chart: one point per day, no confidence gate ─────────────────
+        // Walk every bar in the candidate range; keep the first bar index seen for
+        // each calendar day, score it with the model (no confidence filter, no file
+        // written), and plot the result.
+        {
+            use std::collections::BTreeMap;
+            let mut first_bar_per_day: BTreeMap<chrono::NaiveDate, usize> = BTreeMap::new();
+            for &idx in &scan_indices_for_scatter {
+                first_bar_per_day.entry(bar_dates[idx]).or_insert(idx);
+            }
+
+            let scatter_points: Vec<TradePoint> = first_bar_per_day
+                .into_iter()
+                .filter_map(|(date, idx)| score_bar(&bars, lookback, &mlp, idx, date))
+                .collect();
+
+            if !scatter_points.is_empty() {
+                let scatter_path = {
+                    let stem = chart_out.trim_end_matches(".html");
+                    format!("{}_scatter.html", stem)
+                };
+                write_scatter(&scatter_points, &scatter_path);
+                println!("  Scatter chart : {} ({} days)", scatter_path, scatter_points.len());
+            }
+        }
     }
 }

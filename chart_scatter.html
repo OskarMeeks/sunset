@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stop-Entry AI — Daily Confidence vs P&L</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#131722;color:#d1d4dc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh}
+  #header{display:flex;align-items:center;gap:16px;padding:10px 18px;background:#1e2130;border-bottom:1px solid #2a2e39;flex-shrink:0}
+  #header h1{font-size:14px;font-weight:600;color:#fff;letter-spacing:.04em}
+  #summary{display:flex;gap:20px;padding:6px 18px;background:#1a1e2e;border-bottom:1px solid #2a2e39;font-size:11px;flex-shrink:0;align-items:center;flex-wrap:wrap}
+  .sl{color:#787b86;margin-right:4px} .sv{color:#d1d4dc;font-weight:600} .dv{color:#2a2e39}
+  #wrap{flex:1;position:relative;padding:24px 24px 10px}
+  canvas{display:block}
+  #tooltip{position:fixed;pointer-events:none;background:rgba(19,23,34,.95);border:1px solid #2a2e39;border-radius:6px;padding:8px 12px;font-size:12px;line-height:1.9;display:none;z-index:99}
+  .legend{display:flex;gap:16px;align-items:center;font-size:11px;margin-top:8px}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px;vertical-align:middle}
+</style>
+</head>
+<body>
+<div id="header"><h1>Stop-Entry AI — First Trade per Day: Confidence vs P&amp;L</h1></div>
+<div id="summary">
+  <span><span class="sl">Trading days</span><span class="sv" id="s-days">—</span></span>
+  <span class="dv">|</span>
+  <span><span class="sl">Wins</span><span class="sv" id="s-green">—</span></span>
+  <span class="dv">|</span>
+  <span><span class="sl">Total P&amp;L</span><span class="sv" id="s-pnl">—</span></span>
+  <span class="dv">|</span>
+  <span><span class="sl">Avg daily P&amp;L</span><span class="sv" id="s-avg">—</span></span>
+  <span class="dv">|</span>
+  <span><span class="sl">Avg confidence</span><span class="sv" id="s-conf">—</span></span>
+</div>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div class="legend">
+    <span><span class="dot" style="background:#26a69a"></span>Net profitable day</span>
+    <span><span class="dot" style="background:#ef5350"></span>Net losing day</span>
+    <span><span class="dot" style="background:#b0b0b0"></span>Flat / open only</span>
+  </div>
+</div>
+<div id="tooltip"></div>
+<script>
+(function(){
+  const DATA = [
+  {date:"2026-03-16",x:2.81,y:-0.2649,color:"#ef5350",dir:"SHORT",open:false},
+  {date:"2026-03-17",x:4.08,y:0.3398,color:"#26a69a",dir:"LONG",open:false},
+  {date:"2026-03-18",x:33.95,y:0.3537,color:"#26a69a",dir:"LONG",open:false},
+  {date:"2026-03-19",x:31.96,y:0.4038,color:"#26a69a",dir:"LONG",open:false},
+  {date:"2026-03-20",x:38.15,y:-0.3521,color:"#ef5350",dir:"SHORT",open:false},
+  {date:"2026-03-23",x:4.09,y:-0.5699,color:"#ef5350",dir:"SHORT",open:false},
+  {date:"2026-03-24",x:10.88,y:-0.2516,color:"#ef5350",dir:"SHORT",open:false},
+  {date:"2026-03-25",x:26.03,y:-0.2907,color:"#ef5350",dir:"LONG",open:false},
+  {date:"2026-03-26",x:9.77,y:0.4926,color:"#26a69a",dir:"LONG",open:false},
+  {date:"2026-03-27",x:11.17,y:0.5181,color:"#26a69a",dir:"LONG",open:false},
+  {date:"2026-03-30",x:10.07,y:-0.2926,color:"#ef5350",dir:"LONG",open:false},
+  {date:"2026-03-31",x:31.21,y:-0.2981,color:"#ef5350",dir:"LONG",open:false},
+  {date:"2026-04-01",x:7.35,y:0.6242,color:"#26a69a",dir:"LONG",open:false},
+  {date:"2026-04-02",x:10.78,y:0.6191,color:"#26a69a",dir:"SHORT",open:false},
+  {date:"2026-04-06",x:18.68,y:0.4148,color:"#26a69a",dir:"LONG",open:false},
+  {date:"2026-04-07",x:13.02,y:-0.3610,color:"#ef5350",dir:"LONG",open:false},
+  {date:"2026-04-08",x:23.75,y:-0.4956,color:"#ef5350",dir:"SHORT",open:false},
+  {date:"2026-04-09",x:3.71,y:-0.2560,color:"#ef5350",dir:"LONG",open:false},
+  {date:"2026-04-10",x:10.66,y:-0.1920,color:"#ef5350",dir:"SHORT",open:false},
+  {date:"2026-04-13",x:13.32,y:0.0000,color:"#b0b0b0",dir:"LONG",open:true},
+  {date:"2026-04-14",x:1.55,y:0.3915,color:"#26a69a",dir:"LONG",open:false},
+  {date:"2026-04-15",x:23.84,y:-0.2130,color:"#ef5350",dir:"LONG",open:false},
+  {date:"2026-04-16",x:8.82,y:0.3752,color:"#26a69a",dir:"SHORT",open:false},
+];
+
+  // ── Summary ────────────────────────────────────────────────────
+  const closed = DATA.filter(d => !d.open);
+  const wins   = closed.filter(d => d.color === "#26a69a");
+  const totalPnl = closed.reduce((s,d)=>s+d.y, 0);
+  const avgPnl   = closed.length ? totalPnl / closed.length : 0;
+  const avgConf  = DATA.length ? DATA.reduce((s,d)=>s+d.x,0)/DATA.length : 0;
+
+  document.getElementById("s-days").textContent  = DATA.length;
+  document.getElementById("s-green").textContent = wins.length + " / " + closed.length;
+  document.getElementById("s-pnl").textContent   = (totalPnl >= 0 ? "+" : "") + totalPnl.toFixed(3) + "%";
+  document.getElementById("s-avg").textContent   = (avgPnl   >= 0 ? "+" : "") + avgPnl.toFixed(3)   + "%";
+  document.getElementById("s-conf").textContent  = avgConf.toFixed(1) + "%";
+
+  // ── Canvas ─────────────────────────────────────────────────────
+  const wrap   = document.getElementById("wrap");
+  const canvas = document.getElementById("c");
+  const tip    = document.getElementById("tooltip");
+  const PAD    = {l:68,r:30,t:30,b:50};
+
+  function mapRange(v, inLo, inHi, outLo, outHi) {
+    if (inHi === inLo) return (outLo + outHi) / 2;
+    return outLo + (v - inLo) / (inHi - inLo) * (outHi - outLo);
+  }
+
+  function computeBounds() {
+    const xs = DATA.map(d=>d.x), ys = DATA.map(d=>d.y);
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    const xPad = (xMax - xMin) * 0.08 || 1;
+    const yAbs = Math.max(Math.abs(yMin), Math.abs(yMax));
+    const yPad = yAbs * 0.15 || 0.1;
+    return {
+      xLo: xMin - xPad, xHi: xMax + xPad,
+      yLo: -(yAbs + yPad), yHi: yAbs + yPad,
+    };
+  }
+
+  function draw() {
+    const W = canvas.width, H = canvas.height;
+    const pw = W - PAD.l - PAD.r, ph = H - PAD.t - PAD.b;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, W, H);
+    if (!DATA.length) return;
+
+    const {xLo, xHi, yLo, yHi} = computeBounds();
+    const cx = v => mapRange(v, xLo, xHi, PAD.l, PAD.l + pw);
+    const cy = v => mapRange(v, yLo, yHi, PAD.t + ph, PAD.t);
+
+    // Grid lines
+    const GRID = 5;
+    ctx.lineWidth = 1;
+    for (let g = 0; g <= GRID; g++) {
+      ctx.strokeStyle = "#1e2130";
+      const yv = yLo + (yHi - yLo) * g / GRID;
+      ctx.beginPath(); ctx.moveTo(PAD.l, cy(yv)); ctx.lineTo(PAD.l + pw, cy(yv)); ctx.stroke();
+      const xv = xLo + (xHi - xLo) * g / GRID;
+      ctx.beginPath(); ctx.moveTo(cx(xv), PAD.t); ctx.lineTo(cx(xv), PAD.t + ph); ctx.stroke();
+    }
+
+    // Zero line
+    ctx.strokeStyle = "#3a3e50"; ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath(); ctx.moveTo(PAD.l, cy(0)); ctx.lineTo(PAD.l + pw, cy(0)); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Axis border
+    ctx.strokeStyle = "#2a2e39"; ctx.lineWidth = 1;
+    ctx.strokeRect(PAD.l, PAD.t, pw, ph);
+
+    // Y labels
+    ctx.fillStyle = "#787b86"; ctx.font = "11px sans-serif"; ctx.textAlign = "right";
+    for (let g = 0; g <= GRID; g++) {
+      const yv = yLo + (yHi - yLo) * g / GRID;
+      ctx.fillText(yv.toFixed(2) + "%", PAD.l - 6, cy(yv) + 4);
+    }
+
+    // X labels
+    ctx.textAlign = "center";
+    for (let g = 0; g <= GRID; g++) {
+      const xv = xLo + (xHi - xLo) * g / GRID;
+      ctx.fillText(xv.toFixed(1) + "%", cx(xv), PAD.t + ph + 18);
+    }
+
+    // Axis titles
+    ctx.fillStyle = "#787b86"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("Avg Confidence", PAD.l + pw / 2, PAD.t + ph + 38);
+    ctx.save();
+    ctx.translate(14, PAD.t + ph / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText("Net Daily P&L %", 0, 0);
+    ctx.restore();
+
+    // Points
+    DATA.forEach(p => {
+      const px = cx(p.x), py = cy(p.y);
+      ctx.beginPath(); ctx.arc(px, py, 7, 0, Math.PI*2);
+      ctx.fillStyle   = p.color + "88";
+      ctx.fill();
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth   = 2;
+      ctx.stroke();
+    });
+  }
+
+  // ── Tooltip ────────────────────────────────────────────────────
+  function nearestPoint(mx, my) {
+    const W = canvas.width, H = canvas.height;
+    const pw = W - PAD.l - PAD.r, ph = H - PAD.t - PAD.b;
+    const {xLo, xHi, yLo, yHi} = computeBounds();
+    const cx = v => mapRange(v, xLo, xHi, PAD.l, PAD.l + pw);
+    const cy = v => mapRange(v, yLo, yHi, PAD.t + ph, PAD.t);
+    let best = null, bestD = 22;
+    DATA.forEach(p => {
+      const d = Math.hypot(cx(p.x) - mx, cy(p.y) - my);
+      if (d < bestD) { bestD = d; best = p; }
+    });
+    return best;
+  }
+
+  canvas.addEventListener("mousemove", e => {
+    const rect = canvas.getBoundingClientRect();
+    const p = nearestPoint(e.clientX - rect.left, e.clientY - rect.top);
+    if (p) {
+      const result = p.open ? "Open" : (p.color === "#26a69a" ? "Win ✓" : "Loss ✗");
+      tip.innerHTML =
+        `<b style="color:${p.color}">${p.date} — ${p.dir}</b><br>` +
+        `Confidence: <b>${p.x.toFixed(1)}%</b><br>` +
+        `P&amp;L: <b style="color:${p.color}">${p.y >= 0 ? "+" : ""}${p.y.toFixed(3)}%</b><br>` +
+        `Result: <b>${result}</b>`;
+      tip.style.display = "block";
+      tip.style.left = (e.clientX + 16) + "px";
+      tip.style.top  = (e.clientY - 10) + "px";
+    } else {
+      tip.style.display = "none";
+    }
+  });
+  canvas.addEventListener("mouseleave", () => tip.style.display = "none");
+
+  function resize() {
+    canvas.width  = wrap.clientWidth;
+    canvas.height = wrap.clientHeight - 36;
+    draw();
+  }
+  window.addEventListener("resize", resize);
+  resize();
+})();
+</script>
+</body>
+</html>

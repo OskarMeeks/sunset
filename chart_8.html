@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stop-Entry AI — Chart Preview</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:#131722;color:#d1d4dc;
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    display:flex;flex-direction:column;height:100vh;
+  }
+  #header{
+    display:flex;align-items:center;gap:16px;padding:10px 18px;
+    background:#1e2130;border-bottom:1px solid #2a2e39;flex-shrink:0;
+  }
+  #header h1{font-size:14px;font-weight:600;color:#fff;letter-spacing:.04em}
+  .badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:700;letter-spacing:.06em}
+  #stats{
+    display:flex;gap:20px;padding:6px 18px;
+    background:#1a1e2e;border-bottom:1px solid #2a2e39;
+    font-size:11px;flex-shrink:0;align-items:center;
+  }
+  .stat-lbl{color:#787b86;margin-right:4px}
+  .stat-val{color:#d1d4dc;font-weight:600}
+  .divider{color:#2a2e39}
+  #chart-wrap{flex:1;position:relative;overflow:hidden}
+  #chart{width:100%;height:100%}
+  #info{
+    position:absolute;top:10px;left:10px;z-index:10;
+    background:rgba(19,23,34,.88);border:1px solid #2a2e39;
+    border-radius:6px;padding:10px 14px;font-size:12px;
+    line-height:1.85;pointer-events:none;min-width:190px;
+  }
+  .il{color:#787b86;margin-right:6px}
+  .iv{color:#d1d4dc;font-weight:600}
+  .isep{border-top:1px solid #2a2e39;margin:5px 0}
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>Stop-Entry AI — Chart Preview</h1>
+  <span class="badge" style="background:#ef5350;color:#fff">SHORT ▼</span>
+  <span class="badge" style="background:#ef5350;color:#fff">SL HIT ✗</span>
+</div>
+<div id="stats">
+  <span><span class="stat-lbl">Confidence</span><span class="stat-val">37.9%</span></span>
+  <span class="divider">|</span>
+  <span><span class="stat-lbl">Entry</span><span class="stat-val">252.1631</span></span>
+  <span class="divider">|</span>
+  <span><span class="stat-lbl">SL</span><span class="stat-val" style="color:#ef5350">252.5101</span></span>
+  <span class="divider">|</span>
+  <span><span class="stat-lbl">TP</span><span class="stat-val" style="color:#26a69a">251.6165</span></span>
+  <span class="divider">|</span>
+  <span><span class="stat-lbl">R:R</span><span class="stat-val">1 : 2.31</span></span>
+  <span class="divider">|</span>
+  <span><span class="stat-lbl">P&amp;L</span><span class="stat-val" style="color:#ef5350">-0.138%</span></span>
+  <span class="divider">|</span>
+  <span><span class="stat-lbl">Held</span><span class="stat-val">1 candles (5 min)</span></span>
+  <span style="margin-left:auto;color:#787b86">ATR 0.3075 &nbsp;·&nbsp; SL 0.88× &nbsp;·&nbsp; TP 2.03×</span>
+</div>
+<div id="chart-wrap">
+  <div id="chart"></div>
+  <div id="info">
+    <div><span class="il">Close at signal</span><span class="iv">252.2400</span></div>
+    <div><span class="il">Entry trigger</span><span class="iv">252.1631</span></div>
+    <div class="isep"></div>
+    <div><span class="il">Stop Loss</span><span class="iv" style="color:#ef5350">252.5101</span><span style="color:#787b86;font-size:11px"> (0.88×ATR)</span></div>
+    <div><span class="il">Take Profit</span><span class="iv" style="color:#26a69a">251.6165</span><span style="color:#787b86;font-size:11px"> (2.03×ATR)</span></div>
+    <div class="isep"></div>
+    <div><span class="il">Direction</span><span class="iv" style="color:#ef5350">SHORT ▼</span></div>
+    <div><span class="il">Result</span><span class="iv" style="color:#ef5350">SL HIT ✗</span></div>
+  </div>
+</div>
+<script>
+(function(){
+  const chart = LightweightCharts.createChart(document.getElementById('chart'),{
+    layout:{background:{type:'solid',color:'#131722'},textColor:'#d1d4dc'},
+    grid:{vertLines:{color:'#1e2130'},horzLines:{color:'#1e2130'}},
+    crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
+    rightPriceScale:{borderColor:'#2a2e39'},
+    timeScale:{borderColor:'#2a2e39',timeVisible:true,secondsVisible:false},
+    width:document.getElementById('chart').offsetWidth,
+    height:document.getElementById('chart').offsetHeight,
+  });
+  const SIGNAL_TS=1704221100, ENTRY_TS=1704221400, BAND_END_TS=1704227100;
+  const all=[
+  {time:1704203400,open:250.3700,high:250.3750,low:250.1300,close:250.2650},
+  {time:1704203700,open:250.2700,high:250.3000,low:249.9200,close:249.9700},
+  {time:1704204000,open:249.9500,high:250.2950,low:249.8600,close:249.9900},
+  {time:1704204300,open:249.9601,high:250.5400,low:249.9601,close:250.4500},
+  {time:1704204600,open:250.4900,high:250.6200,low:250.2100,close:250.3150},
+  {time:1704204900,open:250.3200,high:252.2000,low:249.5200,close:252.0800},
+  {time:1704205200,open:252.0300,high:252.1700,low:251.2800,close:251.7850},
+  {time:1704205500,open:251.7950,high:252.3100,low:251.7300,close:252.1900},
+  {time:1704205800,open:252.1775,high:252.4000,low:251.4030,close:252.3250},
+  {time:1704206100,open:252.3400,high:252.5800,low:251.9800,close:252.2200},
+  {time:1704206400,open:252.2850,high:253.0800,low:252.0200,close:253.0600},
+  {time:1704206700,open:253.0250,high:253.2100,low:252.5900,close:252.7100},
+  {time:1704207000,open:252.7106,high:252.8500,low:252.5500,close:252.7300},
+  {time:1704207300,open:252.7400,high:253.1300,low:252.5700,close:252.9100},
+  {time:1704207600,open:252.8600,high:252.9400,low:252.4700,close:252.8550},
+  {time:1704207900,open:252.8250,high:253.1100,low:252.6100,close:253.0450},
+  {time:1704208200,open:253.0450,high:253.5800,low:253.0100,close:253.5000},
+  {time:1704208500,open:253.4850,high:253.5900,low:253.0000,close:253.1100},
+  {time:1704208800,open:253.0700,high:253.8000,low:253.0700,close:253.6700},
+  {time:1704209100,open:253.6350,high:253.7200,low:253.1600,close:253.4508},
+  {time:1704209400,open:253.4700,high:253.5000,low:253.0700,close:253.4900},
+  {time:1704209700,open:253.4300,high:253.5850,low:253.0800,close:253.5800},
+  {time:1704210000,open:253.5900,high:253.6000,low:253.2100,close:253.3750},
+  {time:1704210300,open:253.3700,high:253.8850,low:253.2700,close:253.7150},
+  {time:1704210600,open:253.7000,high:253.7100,low:253.4300,close:253.5500},
+  {time:1704210900,open:253.5800,high:253.8000,low:253.3701,close:253.4800},
+  {time:1704211200,open:253.4900,high:253.8200,low:253.3400,close:253.5000},
+  {time:1704211500,open:253.5100,high:253.5850,low:253.1800,close:253.2700},
+  {time:1704211800,open:253.2550,high:253.7400,low:253.2450,close:253.6300},
+  {time:1704212100,open:253.6200,high:253.6450,low:252.9200,close:253.2800},
+  {time:1704212400,open:253.2800,high:253.4800,low:253.1900,close:253.3300},
+  {time:1704212700,open:253.3400,high:253.4300,low:253.1106,close:253.2400},
+  {time:1704213000,open:253.2300,high:253.3550,low:253.1100,close:253.3127},
+  {time:1704213300,open:253.3150,high:253.5400,low:253.1900,close:253.2900},
+  {time:1704213600,open:253.3100,high:253.3830,low:253.1400,close:253.3100},
+  {time:1704213900,open:253.2900,high:253.2900,low:252.9200,close:253.1600},
+  {time:1704214200,open:253.1300,high:253.2600,low:252.9100,close:253.1600},
+  {time:1704214500,open:253.1500,high:253.2900,low:252.8000,close:253.0050},
+  {time:1704214800,open:253.0300,high:253.1600,low:252.8800,close:252.9850},
+  {time:1704215100,open:253.0300,high:253.2000,low:252.6300,close:252.6300},
+  {time:1704215400,open:252.6400,high:252.8300,low:252.5201,close:252.6250},
+  {time:1704215700,open:252.6300,high:252.7500,low:252.2001,close:252.4650},
+  {time:1704216000,open:252.4600,high:252.5000,low:252.2000,close:252.3301},
+  {time:1704216300,open:252.3600,high:252.7000,low:252.3150,close:252.6850},
+  {time:1704216600,open:252.6700,high:252.8700,low:252.5701,close:252.8109},
+  {time:1704216900,open:252.8410,high:252.8500,low:252.5934,close:252.6800},
+  {time:1704217200,open:252.7100,high:252.8150,low:252.5050,close:252.5100},
+  {time:1704217500,open:252.5000,high:252.9400,low:252.4800,close:252.7200},
+  {time:1704217800,open:252.7200,high:252.8300,low:252.5800,close:252.8300},
+  {time:1704218100,open:252.8150,high:253.1800,low:252.7100,close:253.1330},
+  {time:1704218400,open:253.1000,high:253.3300,low:253.0450,close:253.0600},
+  {time:1704218700,open:253.0800,high:253.1900,low:252.9790,close:253.0128},
+  {time:1704219000,open:253.0200,high:253.1200,low:252.8200,close:253.0800},
+  {time:1704219300,open:253.0899,high:253.1300,low:252.9103,close:253.0250},
+  {time:1704219600,open:253.0200,high:253.0200,low:252.6800,close:252.7100},
+  {time:1704219900,open:252.6900,high:252.7150,low:252.5200,close:252.5450},
+  {time:1704220200,open:252.5400,high:252.7200,low:252.3600,close:252.6300},
+  {time:1704220500,open:252.6400,high:252.6600,low:252.2800,close:252.4400},
+  {time:1704220800,open:252.4400,high:252.5599,low:252.3209,close:252.3650},
+  {time:1704221100,open:252.3700,high:252.4400,low:252.1600,close:252.2400},
+  {time:1704221400,open:252.2400,high:252.5100,low:252.2200,close:252.4300},
+  {time:1704221700,open:252.4100,high:252.4600,low:252.2900,close:252.3100},
+  {time:1704222000,open:252.3000,high:252.4300,low:252.1800,close:252.4202},
+  {time:1704222300,open:252.4200,high:252.4300,low:252.1600,close:252.2200},
+  {time:1704222600,open:252.2200,high:252.5716,low:252.1300,close:252.5400},
+  {time:1704222900,open:252.5350,high:252.9700,low:252.5100,close:252.9200},
+  {time:1704223200,open:252.9150,high:253.1000,low:252.8300,close:253.0430},
+  {time:1704223500,open:253.0491,high:253.1320,low:252.9700,close:253.0400},
+  {time:1704223800,open:253.0400,high:253.1000,low:252.8900,close:252.9000},
+  {time:1704224100,open:252.8802,high:252.9600,low:252.6900,close:252.7400},
+  {time:1704224400,open:252.7300,high:252.7900,low:252.6100,close:252.6300},
+  {time:1704224700,open:252.6305,high:252.8200,low:252.6300,close:252.6600},
+  {time:1704225000,open:252.6600,high:252.7300,low:252.5200,close:252.6498},
+  {time:1704225300,open:252.6382,high:253.4400,low:252.6300,close:253.0500},
+  {time:1704225600,open:253.0150,high:253.0600,low:252.5650,close:252.7800},
+  {time:1704225900,open:252.7900,high:252.8299,low:252.2700,close:252.5313},
+  {time:1704226200,open:252.5300,high:252.6200,low:252.2900,close:252.5100},
+  {time:1704226500,open:252.5019,high:253.0600,low:252.4950,close:253.0099},
+  {time:1704226800,open:253.0100,high:253.0100,low:252.5100,close:252.5800},
+  {time:1704227100,open:252.5900,high:252.6400,low:252.2615,close:252.2700},
+
+  ];
+  const hist=all.filter(c=>c.time<=SIGNAL_TS);
+  const fut =all.filter(c=>c.time> SIGNAL_TS);
+
+  const histS=chart.addCandlestickSeries({
+    upColor:'#26a69a',downColor:'#ef5350',
+    borderUpColor:'#26a69a',borderDownColor:'#ef5350',
+    wickUpColor:'#26a69a',wickDownColor:'#ef5350',
+  });
+  histS.setData(hist);
+  histS.setMarkers([{time:SIGNAL_TS,position:'aboveBar',color:'#ef5350',shape:'arrowDown',text:'Signal',size:1.5}]);
+
+  const futS=chart.addCandlestickSeries({
+    upColor:'#1a4d42',downColor:'#5c1f1f',
+    borderUpColor:'#26a69a',borderDownColor:'#ef5350',
+    wickUpColor:'#26a69a',wickDownColor:'#ef5350',
+  });
+  futS.setData(fut);
+
+  histS.createPriceLine({price:252.5101,color:'#ef5350',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Solid,axisLabelVisible:true,title:'SL'});
+  histS.createPriceLine({price:251.6165,color:'#26a69a',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Solid,axisLabelVisible:true,title:'TP'});
+  histS.createPriceLine({price:252.1631,color:'#4e9af1',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'Entry'});
+
+  const zoneTop=Math.max(252.5101,251.6165)*1.005;
+  const zoneS=chart.addAreaSeries({
+    topColor:'rgba(78,154,241,0.07)',bottomColor:'rgba(78,154,241,0.07)',
+    lineColor:'rgba(78,154,241,0.18)',lineWidth:1,
+    lastValueVisible:false,priceLineVisible:false,crosshairMarkerVisible:false,
+  });
+  const zd=[];
+  for(let t=ENTRY_TS;t<=BAND_END_TS;t+=300) zd.push({time:t,value:zoneTop});
+  if(zd.length) zoneS.setData(zd);
+
+  chart.timeScale().fitContent();
+  new ResizeObserver(()=>{
+    const w=document.getElementById('chart-wrap');
+    chart.resize(w.clientWidth,w.clientHeight);
+  }).observe(document.getElementById('chart-wrap'));
+})();
+</script>
+</body>
+</html>

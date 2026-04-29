@@ -46,10 +46,7 @@ use rayon::prelude::*;
 // ═══════════════════════════════════════════════════════════════════
 
 /// Number of 5-min candles to look forward when labelling training samples.
-/// 20 bars ≈ 100 minutes.  Doubling from 10 gives TP enough runway to exceed
-/// SL in absolute ATR distance, which is impossible in a 50-minute window for
-/// most low-volatility intraday moves.
-const FORWARD: usize = 20; // ≈ 100 minutes
+const FORWARD: usize = 10; // ≈ 50 minutes
 
 
 const MAX_MULT: f64 = 4.0;
@@ -70,22 +67,13 @@ const NOUT: usize = 3;
 /// overfit on train while staying near-random on val.
 const LAMBDA_REG: f64 = 0.40;
 
-/// Minimum acceptable R:R ratio (TP distance / SL distance).
-/// A squared-hinge penalty fires whenever tp_pred / sl_pred < MIN_RR,
-/// pushing TP up and SL down until the ratio is met.
-/// 1.5 means the model must target at least 1.5× reward per unit of risk.
-/// Tune: raise toward 2.0 for stricter R:R; lower toward 1.0 to relax.
-const MIN_RR: f64 = 1.5;
-
-/// Weight of the R:R floor penalty relative to the direction BCE loss.
-/// Larger values enforce the floor more aggressively at the cost of some
-/// flexibility in SL/TP placement.
-const LAMBDA_RR: f64 = 0.30;
-
 /// L2 weight-decay coefficient applied inside the Adam update.
 /// Penalises large weights and is the primary defence against overfitting.
 /// Tune: increase toward 1e-3 if trn/val gap persists; decrease to 1e-5 if underfitting.
-const WEIGHT_DECAY: f64 = 2e-4;
+/// Lowered from 2e-4 to 5e-5: dropout at 0.45 already provides strong regularisation,
+/// and 2e-4 was strong enough to erode hidden-layer weights between sparse gradient
+/// updates, amplifying the ent% re-rise.  Output layer (w3/b3) has no weight decay at all.
+const WEIGHT_DECAY: f64 = 5e-5;
 
 /// Inverted-dropout keep probability for hidden layers during training.
 /// 0.45 means 45 % of units are zeroed each forward pass — raised from 0.30
@@ -107,6 +95,7 @@ const PATIENCE: usize = 30;
 /// Tune:  raise toward 0.12–0.15 to trade less but with higher quality;
 ///        lower toward 0.04 to trade nearly everything again.
 const CONFIDENCE_THRESHOLD: f64 = 0.08;
+
 
 /// Mini-batch size used inside each epoch.
 /// 4096 keeps all 18 Rayon threads saturated with ~228 samples each,
@@ -402,12 +391,25 @@ impl Adam {
                 }
             };
         }
+        // Output layer uses no weight decay: decaying w3/b3 toward zero erodes
+        // the confidence logits on gated samples (which get no gradient to push
+        // back), causing the ent% re-rise pattern after the initial trough.
+        macro_rules! update_nodecay {
+            ($p:expr, $m:expr, $v:expr, $g:expr) => {
+                for k in 0..$p.len() {
+                    let g = $g[k]; // pure gradient — no L2 term
+                    $m[k] = b1 * $m[k] + (1.0 - b1) * g;
+                    $v[k] = b2 * $v[k] + (1.0 - b2) * g * g;
+                    $p[k] -= lr_t * $m[k] / ($v[k].sqrt() + eps);
+                }
+            };
+        }
         update!(mlp.w1, self.m_w1, self.v_w1, gw1);
         update!(mlp.b1, self.m_b1, self.v_b1, gb1);
         update!(mlp.w2, self.m_w2, self.v_w2, gw2);
         update!(mlp.b2, self.m_b2, self.v_b2, gb2);
-        update!(mlp.w3, self.m_w3, self.v_w3, gw3);
-        update!(mlp.b3, self.m_b3, self.v_b3, gb3);
+        update_nodecay!(mlp.w3, self.m_w3, self.v_w3, gw3);
+        update_nodecay!(mlp.b3, self.m_b3, self.v_b3, gb3);
     }
 }
 
@@ -465,26 +467,32 @@ impl Grads {
 /// `seed` is used to create a local per-sample RNG for dropout; pass a unique
 /// value per (epoch, sample) combination, e.g. `epoch * 1_000_003 + sample_idx`.
 fn compute_grads(
-    mlp:      &Mlp,
-    x:        &[f64],
-    dir_lbl:  f64,
-    is_long:  bool,
-    entry_px: f64,
-    atr:      f64,
-    future:   &[Bar],
-    seed:     u64,
+    mlp:          &Mlp,
+    x:            &[f64],
+    dir_lbl:      f64,
+    is_long:      bool,
+    entry_px:     f64,
+    atr:          f64,
+    future:       &[Bar],
+    candles_held: usize,   // from label — scales loss so fast trades get stronger gradient
+    label_ppc:    f64,     // pnl-per-candle of the labelled setup — gates BCE direction
+    seed:         u64,
 ) -> Grads {
     let mut local_rng = Rng(seed.max(1));
     let cache = mlp.forward_train(x, &mut local_rng);
     let FwdCache { pre1, h1, mask1, pre2, h2, mask2, raw } = cache;
 
-    // ── Direction output (raw[0]) — BCE loss ─────────────────────
+    // ── Direction output (raw[0]) — BCE loss ────────────────────────
     let dir_prob = sigmoid(raw[0]);
     let eps = 1e-7_f64;
-    let dir_loss = -(
-        dir_lbl       * (dir_prob + eps).ln()
-        + (1.0 - dir_lbl) * (1.0 - dir_prob + eps).ln()
-    );
+
+    // Every sample contributes a full direction gradient regardless of ppc
+    // quality.  The model learns direction from the entire data range; the
+    // confidence threshold at inference time still filters which signals are
+    // acted on, but training is no longer gated on label quality.
+    let dir_loss = -(dir_lbl * (dir_prob + eps).ln()
+                   + (1.0 - dir_lbl) * (1.0 - dir_prob + eps).ln());
+    let d_raw0 = dir_prob - dir_lbl;
 
     // ── SL / TP outputs — sigmoid-scaled ────────────────────────
     let sl_sig  = sigmoid(raw[1]);
@@ -542,11 +550,7 @@ fn compute_grads(
             let z = k * (sl_pred - adverse_atr);
             let s = sigmoid(z);
             log_surv      += s.max(1e-12).ln();
-            // Clamp per-bar contribution to ≤ 2.0 (was k*(1-s) ≤ 8.0).
-            // Without this, a tight SL on a volatile sample accumulates a raw
-            // gradient of ~k * FORWARD ≈ 80 in the first epochs, causing the
-            // SL to slam wide in a single Adam step and never recover.
-            d_log_surv_sl += (k * (1.0 - s)).min(2.0);
+            d_log_surv_sl += k * (1.0 - s);
 
             let fav = if is_long {
                 (bar.high - entry_px).max(0.0) / atr
@@ -564,45 +568,28 @@ fn compute_grads(
         let s_tp  = sigmoid(z_tp);
         let d_stp = -k * s_tp * (1.0 - s_tp); // d(s_tp)/d(tp_pred)
 
-        // soft_R = surv * s_tp * tp_pred / sl_pred
+        // soft_R_ppc = soft_R / candles_held
+        // Dividing by candles_held (a non-differentiable constant for this sample)
+        // scales the entire R-multiple reward by the speed of the trade.
+        // A 1 % gain in 1 candle contributes the same loss magnitude as a
+        // 5 % gain over 5 candles — the model is rewarded for fast captures.
+        let ch = candles_held.max(1) as f64;
         let sl_safe  = sl_pred.max(1e-6);
-        let soft_r   = surv * s_tp * tp_pred / sl_safe;
+        let soft_r   = surv * s_tp * tp_pred / sl_safe / ch;
 
-        // d(soft_R)/d(sl_pred):
-        //   = d(surv)/d(sl_pred) * s_tp * tp_pred / sl_safe
-        //   + surv * s_tp * tp_pred * (-1/sl_safe^2)
-        let d_r_sl = d_surv_sl * s_tp * tp_pred / sl_safe
-                   - surv * s_tp * tp_pred / (sl_safe * sl_safe);
+        // d(soft_R_ppc)/d(sl_pred)  =  [original d_r_sl] / ch
+        let d_r_sl = (d_surv_sl * s_tp * tp_pred / sl_safe
+                   - surv * s_tp * tp_pred / (sl_safe * sl_safe)) / ch;
 
-        // d(soft_R)/d(tp_pred):
-        //   = surv * d(s_tp)/d(tp_pred) * tp_pred / sl_safe
-        //   + surv * s_tp / sl_safe
-        let d_r_tp = surv * d_stp * tp_pred / sl_safe
-                   + surv * s_tp  / sl_safe;
+        // d(soft_R_ppc)/d(tp_pred)  =  [original d_r_tp] / ch
+        let d_r_tp = (surv * d_stp * tp_pred / sl_safe
+                   + surv * s_tp  / sl_safe) / ch;
 
-        // ── R:R floor penalty — squared hinge on tp_pred / sl_pred ──────────
-        //
-        // Fires whenever tp_pred / sl_pred < MIN_RR.
-        //
-        // penalty  = max(0, MIN_RR - tp/sl)²
-        // d/d(tp)  = -2 * hinge / sl          (negative → gradient pushes TP up)
-        // d/d(sl)  = +2 * hinge * tp / sl²    (positive → gradient pushes SL down)
-        //
-        // This directly counteracts the asymmetry where the survival term always
-        // widens SL while the TP-hit term always lowers TP, collapsing R:R < 1.
-        let rr         = tp_pred / sl_safe;
-        let hinge      = (MIN_RR - rr).max(0.0);
-        let rr_penalty = hinge * hinge;
-        let d_rr_d_tp  = -2.0 * hinge / sl_safe;
-        let d_rr_d_sl  =  2.0 * hinge * tp_pred / (sl_safe * sl_safe);
-
-        // loss = -soft_R + LAMBDA_RR * rr_penalty
-        // so d(loss)/d(*) = -d(soft_R)/d(*) + LAMBDA_RR * d(rr_penalty)/d(*)
-        (-soft_r + LAMBDA_RR * rr_penalty, -d_r_sl + LAMBDA_RR * d_rr_d_sl, -d_r_tp + LAMBDA_RR * d_rr_d_tp)
+        // loss = -soft_R_ppc, so d(loss)/d(*) = -d(soft_R_ppc)/d(*)
+        (-soft_r, -d_r_sl, -d_r_tp)
     };
 
     // ── Output-layer gradients w.r.t. raw[*] ────────────────────
-    let d_raw0 = dir_prob - dir_lbl;
     let d_raw1 = LAMBDA_REG * d_r_d_sl * (MAX_MULT - 0.3) * sl_sig * (1.0 - sl_sig);
     let d_raw2 = LAMBDA_REG * d_r_d_tp * (MAX_MULT - 0.5) * tp_sig * (1.0 - tp_sig);
     let d_raw  = [d_raw0, d_raw1, d_raw2];
@@ -692,17 +679,24 @@ fn current_atr(bars: &[Bar], period: usize) -> f64 {
 // ═══════════════════════════════════════════════════════════════════
 
 struct Sample {
-    features:   Vec<f64>,
-    dir_label:  f64,   // 1.0 = Long, 0.0 = Short
-    sl_mult:    f64,   // SL distance in ATR multiples  (MAE+buffer label)
-    tp_mult:    f64,   // TP distance in ATR multiples  (MFE label)
+    features:    Vec<f64>,
+    dir_label:   f64,   // 1.0 = Long, 0.0 = Short
+    sl_mult:     f64,   // SL distance in ATR multiples  (MAE+buffer label)
+    tp_mult:     f64,   // TP distance in ATR multiples  (best pnl-per-candle label)
     /// Best SL in ATR units (the label itself) — used for the SL-efficiency penalty gradient.
-    sl_mae_raw: f64,
+    sl_mae_raw:  f64,
     /// Raw MFE in ATR units — used for the TP-realism penalty gradient.
-    tp_mfe_raw: f64,
-    atr:        f64,
-    close:      f64,
-    future:     Vec<Bar>,
+    tp_mfe_raw:  f64,
+    /// Candles from entry trigger to exit at the labelled TP — used to scale the loss
+    /// so fast trades receive amplified gradient vs slow ones.
+    candles_held: usize,
+    /// Best pnl-per-candle (%) achieved by the labelled TP — used to gate BCE:
+    /// high-ppc samples get a normal direction gradient; low-ppc samples get a
+    /// gentle push toward 0.5 so the model learns to abstain on weak setups.
+    label_ppc:   f64,
+    atr:         f64,
+    close:       f64,
+    future:      Vec<Bar>,
 }
 
 
@@ -793,32 +787,63 @@ fn build_samples(bars: &[Bar], lookback: usize) -> Vec<Sample> {
         // a wider SL than the best one we found.
         let sl_mae_raw = best_sl_mult;
 
-        // ── Step 3: TP label from MFE at the best SL ─────────────────────
-        // Simulate with the best SL and a huge TP to measure the MFE the
-        // model should aim to reach.
+        // ── Step 3: TP label — pick TP that maximises pnl per candle held ────
+        // Rather than targeting the raw MFE, we scan a grid of TP candidates
+        // and choose the distance where pct_gain / candles_held is highest.
+        // A 0.8-ATR TP hit in 1 candle outscores a 3-ATR TP hit in 8 candles.
+        // This biases the model toward fast, impulsive moves.
+        const TP_CANDIDATES: &[f64] = &[
+            0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0,
+        ];
+
         let best_sl_px = if is_long {
             close - sl_mult * atr
         } else {
             close + sl_mult * atr
         };
-        let (tp_mult, tp_mfe_raw) =
-            simulate(is_long, entry_high, entry_low, best_sl_px, big_tp_for_mfe, future)
-                .map(|t| {
-                    let mfe_atr = t.mfe / atr;
-                    (mfe_atr.clamp(0.5, MAX_MULT), mfe_atr)
-                })
-                .unwrap_or((LABEL_TP_MULT, LABEL_TP_MULT));
+
+        let mut best_tp_mult    = LABEL_TP_MULT;
+        let mut best_ppc        = f64::NEG_INFINITY;
+        let mut best_candles    = 1_usize;
+
+        for &tc in TP_CANDIDATES {
+            let tp_px = if is_long {
+                close + tc * atr
+            } else {
+                close - tc * atr
+            };
+            if let Some(t) = simulate(is_long, entry_high, entry_low, best_sl_px, tp_px, future) {
+                if t.won && t.candles_held > 0 {
+                    let ppc = t.pct_gain / t.candles_held as f64;
+                    if ppc > best_ppc {
+                        best_ppc     = ppc;
+                        best_tp_mult = tc;
+                        best_candles = t.candles_held;
+                    }
+                }
+            }
+        }
+
+        // Fall back to smallest winning TP if no ppc candidate beat -inf.
+        let (tp_mult, candles_held, label_ppc) = if best_ppc > f64::NEG_INFINITY {
+            (best_tp_mult.clamp(0.5, MAX_MULT), best_candles, best_ppc)
+        } else {
+            (LABEL_TP_MULT, 1, 0.0)
+        };
+        let tp_mfe_raw = tp_mult; // kept for struct compatibility
 
         samples.push(Sample {
-            features:   features.to_vec(),
-            dir_label:  if is_long { 1.0 } else { 0.0 },
+            features:    features.to_vec(),
+            dir_label:   if is_long { 1.0 } else { 0.0 },
             sl_mult,
             tp_mult,
             sl_mae_raw,
             tp_mfe_raw,
+            candles_held,
+            label_ppc,
             atr,
             close,
-            future:     future.to_vec(),
+            future:      future.to_vec(),
         });
     }
 
@@ -950,8 +975,8 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
     let mut idx: Vec<usize> = balanced_idx;
 
     // ── Two-row column header ─────────────────────────────────────────────────────────────────────
-    println!("\n{:<6}  {:<20}  {:<12}  {:<12}  {:<10}  {:<10}  {:<8}  {:<8}  {:<8}  {:<8}  {:<8}  {}",
-        "Epoch", "loss", "trn_dir%", "val_dir%", "ent%", "pnl%", "win%", "pf", "sl_mae", "tp_mae", "cap%", "sec");
+    println!("\n{:<6}  {:<20}  {:<12}  {:<12}  {:<10}  {:<8}  {:<8}  {:<8}  {:<8}  {:<8}  {}",
+        "Epoch", "loss", "trn_dir%", "val_dir%", "ppc%", "win%", "pf", "sl_mae", "tp_mae", "cap%", "sec");
     println!("{}", "─".repeat(130));
 
     // ── Early-stopping state ──────────────────────────────────────────────
@@ -959,19 +984,14 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
     // it improves.  If it hasn't improved for PATIENCE reporting intervals
     // (each interval = 5 epochs), training stops and the best checkpoint is
     // restored automatically (it was already saved to disk).
-    let mut best_val_pnl:    f64   = f64::NEG_INFINITY;
+    // Save criterion: avg_pnl * profit_factor.
+    // Using avg_pnl alone is fooled by a model that enters very few trades
+    // (high avg because marginals are filtered) or by win-rate dilution as
+    // ent% rises.  Multiplying by profit_factor collapses the score whenever
+    // win% drops or loss size grows — both of which happen as confidence
+    // inflation lets marginal trades through.
+    let mut best_val_score:  f64   = f64::NEG_INFINITY;
     let mut patience_counter: usize = 0;
-
-    // ── Entry-rate (ent%) rise detection ─────────────────────────────────
-    // While ent is falling the model is getting more selective — good.
-    // Once ent starts climbing back up the model is losing conviction and
-    // overfitting.  We stop after 2 consecutive reporting intervals where
-    // ent is higher than the previous interval, but only once ent has
-    // actually reached a low (< 1 %) so we don't fire during the initial
-    // high-ent warm-up phase.
-    let mut min_ent_seen:    f64   = f64::INFINITY;
-    let mut prev_ent:        f64   = f64::INFINITY;
-    let mut ent_rise_streak: usize = 0;
 
     for epoch in 0..epochs {
         let t_ep = Instant::now();
@@ -1003,6 +1023,8 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
                         let g = compute_grads(
                             &mlp, &s.features,
                             s.dir_label, is_long, entry_px, s.atr, &s.future,
+                            s.candles_held,
+                            s.label_ppc,
                             seed,
                         );
                         local.add_assign(g);
@@ -1064,13 +1086,8 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
 
             let mut capture_ratios: Vec<f64> = Vec::new();
 
-            let mut n_conf_passed = 0usize;
             for s in val_set.iter() {
                 let (dir_prob, sm, tm) = mlp.predict(&s.features);
-                // Skip low-confidence signals — only trade when the model is
-                // sufficiently decisive (|dir_prob - 0.5| >= confidence_threshold).
-                if (dir_prob - 0.5).abs() < confidence_threshold { continue; }
-                n_conf_passed += 1;
                 let is_long = dir_prob >= 0.5;
                 let (sl, tp) = if is_long {
                     (s.close - sm * s.atr, s.close + tm * s.atr)
@@ -1083,7 +1100,10 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
                 let entry_px   = if is_long { entry_high } else { entry_low };
 
                 if let Some(t) = simulate(is_long, entry_high, entry_low, sl, tp, &s.future) {
-                    sim_pnls.push(t.pct_gain);
+                    // Track pnl-per-candle: a fast exit scores the same per-candle
+                    // as a slow exit that earns proportionally more in total.
+                    let ppc = t.pct_gain / t.candles_held.max(1) as f64;
+                    sim_pnls.push(ppc);
                     if t.won { n_wins += 1; } else { n_losses += 1; }
 
                     // Best possible stop-loss position: re-simulate the same entry
@@ -1123,12 +1143,12 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
             }
 
             let n_triggered = n_wins + n_losses;
-            let avg_pnl  = if sim_pnls.is_empty() { f64::NAN }
+            let avg_ppc  = if sim_pnls.is_empty() { f64::NAN }
                            else { sim_pnls.iter().sum::<f64>() / sim_pnls.len() as f64 };
             let win_rate = if n_triggered > 0 {
                 n_wins as f64 / n_triggered as f64 * 100.0
             } else { f64::NAN };
-            // profit factor: ratio of gross wins to gross losses
+            // profit factor: ratio of gross ppc-wins to gross ppc-losses
             let profit_factor = {
                 let gw = sim_pnls.iter().filter(|&&p| p > 0.0).sum::<f64>();
                 let gl = sim_pnls.iter().filter(|&&p| p < 0.0).map(|p| p.abs()).sum::<f64>();
@@ -1137,16 +1157,14 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
             let avg_capture = if capture_ratios.is_empty() { f64::NAN }
                               else { capture_ratios.iter().sum::<f64>() / capture_ratios.len() as f64 };
 
-            let pnl_str     = if avg_pnl.is_nan()     { format!("{:>8}", "n/a") }
-                              else { format!("{:>+7.3}%", avg_pnl) };
+            let ppc_str      = if avg_ppc.is_nan()       { format!("{:>8}", "n/a") }
+                              else { format!("{:>+7.4}%", avg_ppc) };
             let win_str     = if win_rate.is_nan()     { format!("{:>6}", "n/a") }
                               else { format!("{:>5.1}%", win_rate) };
             let pf_str      = if profit_factor.is_nan(){ format!("{:>6}", "n/a") }
                               else { format!("{:>5.2}", profit_factor) };
             let capture_str = if avg_capture.is_nan()  { format!("{:>6}", "n/a") }
                               else { format!("{:>5.1}%", avg_capture) };
-            let pct_entered = n_conf_passed as f64 / nv * 100.0;
-
             // average per-sample loss
             let total_loss = (sum_dir + sum_off) / n;
 
@@ -1172,13 +1190,14 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
                     let entry_high = s.close + 0.25 * s.atr;
                     let entry_low  = s.close - 0.25 * s.atr;
                     if let Some(t) = simulate(is_long, entry_high, entry_low, sl, tp, &s.future) {
-                        fy_pnls.push(t.pct_gain);
+                        let ppc = t.pct_gain / t.candles_held.max(1) as f64;
+                        fy_pnls.push(ppc);
                         if t.won { fy_wins += 1; } else { fy_losses += 1; }
                     }
                 }
 
                 let fy_n        = (fy_wins + fy_losses) as f64;
-                let fy_avg_pnl  = if fy_pnls.is_empty() { f64::NAN }
+                let fy_avg_ppc  = if fy_pnls.is_empty() { f64::NAN }
                                   else { fy_pnls.iter().sum::<f64>() / fy_pnls.len() as f64 };
                 let fy_win_rate = if fy_n > 0.0 { fy_wins as f64 / fy_n * 100.0 } else { f64::NAN };
                 let fy_pf = {
@@ -1187,8 +1206,8 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
                     if gl < 1e-9 { f64::NAN } else { gw / gl }
                 };
                 format!(
-                    "  | ho: pnl={:>+6.3}%  win={:>5.1}%  pf={:>5.2}  tr={}/sk={}",
-                    if fy_avg_pnl.is_nan() { 0.0 } else { fy_avg_pnl },
+                    "  | ho: ppc={:>+6.4}%  win={:>5.1}%  pf={:>5.2}  tr={}/sk={}",
+                    if fy_avg_ppc.is_nan() { 0.0 } else { fy_avg_ppc },
                     if fy_win_rate.is_nan() { 0.0 } else { fy_win_rate },
                     if fy_pf.is_nan() { 0.0 } else { fy_pf },
                     fy_wins + fy_losses,
@@ -1199,52 +1218,34 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
             };
 
             println!(
-                "ep={:<5}  loss={:.4}  trn={:>5.1}%  val={:>5.1}%  ent={:>6.2}%  pnl={}  win={}  pf={}  sl={:.3}  tp={:.3}  cap={}  {:.2}s{}",
-                epoch+1, total_loss, train_dir, val_dir, pct_entered,
-                pnl_str, win_str, pf_str, sl_mae, tp_mae, capture_str, ep_sec,
+                "ep={:<5}  loss={:.4}  trn={:>5.1}%  val={:>5.1}%  ppc={}  win={}  pf={}  sl={:.3}  tp={:.3}  cap={}  {:.2}s{}",
+                epoch+1, total_loss, train_dir, val_dir,
+                ppc_str, win_str, pf_str, sl_mae, tp_mae, capture_str, ep_sec,
                 holdout_str
             );
-
-            // ── Entry-rate rise detection ─────────────────────────────────
-            // Update the running minimum and consecutive-rise counter.
-            if pct_entered < min_ent_seen {
-                // New low — model is still getting more selective.
-                min_ent_seen    = pct_entered;
-                ent_rise_streak = 0;
-            } else if pct_entered > prev_ent {
-                // Higher than last interval — model is losing conviction.
-                ent_rise_streak += 1;
-            } else {
-                // Flat or down — streak broken.
-                ent_rise_streak = 0;
-            }
-            prev_ent = pct_entered;
-
-            // Fire only after ent has actually bottomed out (< 1 %) AND has
-            // now risen for 2 consecutive reporting intervals.
-          //  if ent_rise_streak >= 2 && min_ent_seen < 1.0 {
-               // println!(
-            //        "\nEarly stopping: ent% rising for {} consecutive intervals \
-              //       (now {:.2}%, min was {:.2}%). Best val PNL: {:+.4}%",
-               //     ent_rise_streak, pct_entered, min_ent_seen, best_val_pnl
-            //    );
-              //  println!("Best weights already saved → {}", weights_path);
-             //   return;
-          //  }
-
             // ── Early stopping check ──────────────────────────────────────
-            if !avg_pnl.is_nan() && avg_pnl > best_val_pnl {
-                best_val_pnl     = avg_pnl;
+            // ── Checkpoint save: score = avg_pnl × profit_factor ─────────────
+            // avg_pnl alone ignores win-rate/loss-size degradation as ent% rises.
+            // profit_factor encodes both simultaneously: it falls the moment
+            // marginal trades dilute wins or inflate losses.
+            let val_score = if avg_ppc.is_nan() || profit_factor.is_nan() {
+                f64::NEG_INFINITY
+            } else {
+                avg_ppc * profit_factor
+            };
+            if val_score > best_val_score {
+                best_val_score   = val_score;
                 patience_counter = 0;
                 // Save the best checkpoint immediately so we keep it on break.
                 mlp.save(weights_path);
             } else {
+
                 patience_counter += 1;
                 if patience_counter >= PATIENCE {
                     println!(
-                        "\nEarly stopping: val PNL has not improved for {} reporting \
-                         intervals ({} epochs). Best val PNL: {:+.4}%",
-                        PATIENCE, PATIENCE * 5, best_val_pnl
+                        "\nEarly stopping: val score has not improved for {} reporting \
+                         intervals ({} epochs). Best val score: {:+.4}",
+                        PATIENCE, PATIENCE * 5, best_val_score
                     );
                     println!("Best weights already saved → {}", weights_path);
                     return;
@@ -1254,11 +1255,11 @@ fn train(bars: &[Bar], lookback: usize, epochs: usize, lr: f64, weights_path: &s
     }
 
     // If we finished all epochs without early-stopping, only save if we haven't
-    // already saved a better checkpoint (best_val_pnl guard).
-    if best_val_pnl == f64::NEG_INFINITY {
+    // already saved a better checkpoint (best_val_score guard).
+    if best_val_score == f64::NEG_INFINITY {
         mlp.save(weights_path);
     } else {
-        println!("Training complete. Best val PNL: {:+.4}%  weights → {}", best_val_pnl, weights_path);
+        println!("Training complete. Best val score: {:+.4}  weights → {}", best_val_score, weights_path);
     }
 }
 
@@ -1411,8 +1412,10 @@ fn evaluate(bars: &[Bar], lookback: usize, mlp: &Mlp, confidence_threshold: f64)
 
     // Expectancy (avg $ per unit risked, assuming SL_ATR = 1 unit)
     let profit_factor = {
-        let gross_win  = trades.iter().filter(|t|  t.won).map(|t| t.pct_gain).sum::<f64>();
-        let gross_loss = trades.iter().filter(|t| !t.won).map(|t| t.pct_gain.abs()).sum::<f64>();
+        let gross_win  = trades.iter().filter(|t|  t.won)
+            .map(|t| t.pct_gain / t.candles_held.max(1) as f64).sum::<f64>();
+        let gross_loss = trades.iter().filter(|t| !t.won)
+            .map(|t| (t.pct_gain / t.candles_held.max(1) as f64).abs()).sum::<f64>();
         if gross_loss < 1e-9 { f64::INFINITY } else { gross_win / gross_loss }
     };
 
